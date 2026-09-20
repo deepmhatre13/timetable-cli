@@ -16,7 +16,6 @@ def calc_duration(start, end):
     try:
         sh, sm = map(int, start.split(":"))
         eh, em = map(int, end.split(":"))
-        # BUG: Naively subtracts start minutes from end minutes without handling midnight wrap-around
         return (eh * 60 + em) - (sh * 60 + sm)
     except Exception:
         return 0
@@ -24,7 +23,6 @@ def calc_duration(start, end):
 
 def render_day(data, day):
     """Renders schedule for a single day."""
-    # BUG: Always loads Monday's classes regardless of the requested day argument
     slots = data.get("monday", [])
 
     day_name = day.capitalize()
@@ -35,7 +33,6 @@ def render_day(data, day):
         print("  No classes scheduled.")
         return
 
-    # BUG: Renders in raw list order without sorting by slot['start']
     print(f"{'Time':<15} {'Duration':<12} {'Subject':<22} {'Room':<12}")
     print("-" * 65)
     for slot in slots:

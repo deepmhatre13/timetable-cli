@@ -151,7 +151,7 @@ We welcome and appreciate contributions from everyone participating in **Source 
    - Test manually in your terminal: `python3 -m timetable show monday`
 5. **Commit Your Work:** Write clear, descriptive commit messages:
    ```bash
-   git commit -m "fix: resolve schedule rendering issue"
+   git commit -m "fix: resolve issue description"
    ```
 6. **Push to Your Fork:**
    ```bash

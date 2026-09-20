@@ -22,7 +22,6 @@ def cmd_add(args):
     data = load_timetable(args.file)
     day = args.day.lower()
 
-    # BUG: Does not check against valid weekdays, allowing invalid days like 'funday'
     if day not in data:
         data[day] = []
 
