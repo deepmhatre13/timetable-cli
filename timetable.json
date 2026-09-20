@@ -1,0 +1,86 @@
+{
+  "monday": [
+    {
+      "subject": "Mathematics",
+      "start": "09:00",
+      "end": "10:30",
+      "room": "Room 101"
+    },
+    {
+      "subject": "Data Structures",
+      "start": "11:00",
+      "end": "12:30",
+      "room": "Lab 2"
+    },
+    {
+      "subject": "Computer Networks",
+      "start": "14:00",
+      "end": "15:30",
+      "room": "Room 204"
+    }
+  ],
+  "tuesday": [
+    {
+      "subject": "Database Systems",
+      "start": "11:00",
+      "end": "12:30",
+      "room": "Lab 1"
+    },
+    {
+      "subject": "Operating Systems",
+      "start": "08:30",
+      "end": "10:00",
+      "room": "Room 302"
+    },
+    {
+      "subject": "Software Engineering",
+      "start": "13:30",
+      "end": "15:00",
+      "room": "Room 105"
+    }
+  ],
+  "wednesday": [
+    {
+      "subject": "Algorithms Lab",
+      "start": "09:00",
+      "end": "11:00",
+      "room": "Computing Lab"
+    },
+    {
+      "subject": "Web Development",
+      "start": "11:30",
+      "end": "13:00",
+      "room": "Lab 4"
+    }
+  ],
+  "thursday": [
+    {
+      "subject": "Artificial Intelligence",
+      "start": "10:00",
+      "end": "11:30",
+      "room": "Seminar Hall"
+    },
+    {
+      "subject": "Mathematics Tutorial",
+      "start": "12:00",
+      "end": "13:00",
+      "room": "Room 101"
+    }
+  ],
+  "friday": [
+    {
+      "subject": "Cloud Computing",
+      "start": "10:00",
+      "end": "11:30",
+      "room": "Room 202"
+    },
+    {
+      "subject": "Hackathon Lab Prep",
+      "start": "23:00",
+      "end": "01:00",
+      "room": "Innovation Center"
+    }
+  ],
+  "saturday": [],
+  "sunday": []
+}
