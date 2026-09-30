@@ -1,0 +1,22 @@
+name: PR description
+
+# pull_request_target runs without approval on pull requests from forks. It never checks out
+# the pull request's code, it only reads the description, so that's safe.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  how-it-works:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The "How it works" section is filled in
+        run: |
+          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > body.md
+          text=$(awk '/^## /{on = /^## How it works/; next} on' body.md | sed 's/<!--.*-->//g' | tr -s '[:space:]' ' ')
+          if [ "${#text}" -lt 60 ]; then
+            echo "::error::Explain your change under '## How it works' in the pull request description, in your own words (a couple of sentences). Edit the description and this check re-runs."
+            exit 1
+          fi
