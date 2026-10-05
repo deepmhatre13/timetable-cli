@@ -9,6 +9,8 @@ You need Python 3.8 or newer.
 ```
 python3 -m timetable show monday
 python3 -m timetable week
+python3 -m timetable now
+python3 -m timetable export
 python3 -m timetable add --day friday --subject "Maths" --start 09:00 --end 10:00 --room "Room 101"
 python3 -m unittest discover tests
 ```
@@ -21,6 +23,8 @@ On Windows, use `python` instead of `python3`.
 |---|---|
 | `show <day>` | One day's classes |
 | `week` | The whole week, Monday to Sunday |
+| `now` | What's on right now, and what's next |
+| `export [--output FILE]` | Writes a `timetable.ics` calendar file |
 | `add --day --subject --start --end --room` | Adds a class |
 
 ## How it's supposed to work
@@ -31,10 +35,31 @@ On Windows, use `python` instead of `python3`.
 - `add` refuses a class that overlaps another one on the same day, and says which one it clashes with.
 - Each class shows how long it is, in minutes.
 
+## What's on now
+
+```
+python3 -m timetable now
+```
+
+Looks at today's date, works out which class is running at this moment, and which one starts next, with a countdown in minutes. If nothing is running it says so, and if the day is finished it says that too.
+
+## Exporting to a calendar
+
+```
+python3 -m timetable export
+python3 -m timetable export --output timetable.ics
+```
+
+Writes an `.ics` file (default name `timetable.ics`) containing every class as a weekly recurring event, so you can import your timetable into Google Calendar, Apple Calendar, Outlook and the like. Each class becomes one `VEVENT` with the subject as the title and the room as the location, repeating every week.
+
+Because `timetable.json` only stores a weekday and a time rather than a date, each weekday is mapped onto a fixed reference date in one week, and that date carries the weekly repeat rule. The same timetable always exports the same file.
+
 ## Code
 
 - `timetable/loader.py`: reading and writing `timetable.json`
-- `timetable/display.py`: printing a day or the week
+- `timetable/display.py`: printing a day or the week, plus time parsing
+- `timetable/now.py`: working out what's on right now
+- `timetable/export.py`: writing the `.ics` calendar file
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
 

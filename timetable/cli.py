@@ -6,6 +6,8 @@ from pathlib import Path
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.display import render_day, render_week, WEEKDAYS
+from timetable.now import current_now, render_now
+from timetable.export import export_ics
 
 
 def cmd_show(args):
@@ -16,6 +18,17 @@ def cmd_show(args):
 def cmd_week(args):
     data = load_timetable(args.file)
     render_week(data)
+
+
+def cmd_now(args):
+    data = load_timetable(args.file)
+    render_now(data, now=current_now())
+
+
+def cmd_export(args):
+    data = load_timetable(args.file)
+    export_ics(data, args.output)
+    print(f"Exported {args.output}")
 
 
 def cmd_add(args):
@@ -49,6 +62,15 @@ def main():
     # week
     p_week = subparsers.add_parser("week", help="Show full weekly schedule")
     p_week.set_defaults(func=cmd_week)
+
+    # now
+    p_now = subparsers.add_parser("now", help="Show what is on right now")
+    p_now.set_defaults(func=cmd_now)
+
+    # export
+    p_export = subparsers.add_parser("export", help="Export the timetable as an .ics calendar file")
+    p_export.add_argument("--output", default="timetable.ics", help="Path of the .ics file to write (default: timetable.ics)")
+    p_export.set_defaults(func=cmd_export)
 
     # add
     p_add = subparsers.add_parser("add", help="Add a new class slot")

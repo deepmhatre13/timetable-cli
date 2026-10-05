@@ -1,5 +1,7 @@
 """Terminal display and table rendering for timetable."""
 
+from datetime import time as dt_time
+
 WEEKDAYS = [
     "monday",
     "tuesday",
@@ -9,6 +11,14 @@ WEEKDAYS = [
     "saturday",
     "sunday"
 ]
+
+
+def parse_time(value):
+    """Parses a 24-hour HH:MM string into a datetime.time.
+
+    Raises ValueError for anything that is not a valid clock time.
+    """
+    return dt_time.fromisoformat(value)
 
 
 def calc_duration(start, end):
