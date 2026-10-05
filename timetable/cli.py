@@ -6,6 +6,7 @@ from pathlib import Path
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.display import render_day, render_week, WEEKDAYS
+from timetable.filter import filter_timetable, render_filter
 from timetable.now import current_now, render_now
 from timetable.export import export_ics
 
@@ -23,6 +24,18 @@ def cmd_week(args):
 def cmd_now(args):
     data = load_timetable(args.file)
     render_now(data, now=current_now())
+
+
+def cmd_filter(args):
+    data = load_timetable(args.file)
+    results = filter_timetable(
+        data,
+        day=args.day,
+        start=args.start,
+        end=args.end,
+        room=args.room,
+    )
+    render_filter(results, day=args.day, start=args.start, end=args.end, room=args.room)
 
 
 def cmd_export(args):
@@ -66,6 +79,14 @@ def main():
     # now
     p_now = subparsers.add_parser("now", help="Show what is on right now")
     p_now.set_defaults(func=cmd_now)
+
+    # filter
+    p_filter = subparsers.add_parser("filter", help="Filter classes by day, time range and room")
+    p_filter.add_argument("--day", help="Day of the week (e.g. monday, tuesday)")
+    p_filter.add_argument("--start", help="Range start time (HH:MM)")
+    p_filter.add_argument("--end", help="Range end time (HH:MM)")
+    p_filter.add_argument("--room", help="Room/location to match exactly")
+    p_filter.set_defaults(func=cmd_filter)
 
     # export
     p_export = subparsers.add_parser("export", help="Export the timetable as an .ics calendar file")
