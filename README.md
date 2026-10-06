@@ -11,6 +11,7 @@ python3 -m timetable show monday
 python3 -m timetable week
 python3 -m timetable now
 python3 -m timetable export
+python3 -m timetable filter --day monday --start 09:00 --end 12:00
 python3 -m timetable add --day friday --subject "Maths" --start 09:00 --end 10:00 --room "Room 101"
 python3 -m unittest discover tests
 ```
@@ -25,6 +26,7 @@ On Windows, use `python` instead of `python3`.
 | `week` | The whole week, Monday to Sunday |
 | `now` | What's on right now, and what's next |
 | `export [--output FILE]` | Writes a `timetable.ics` calendar file |
+| `filter [--day --start --end --room]` | Classes matching a day, time range and/or room |
 | `add --day --subject --start --end --room` | Adds a class |
 | `diff <first> <second>` | Compares two timetable files and reports what changed |
 
@@ -55,6 +57,15 @@ Writes an `.ics` file (default name `timetable.ics`) containing every class as a
 
 Because `timetable.json` only stores a weekday and a time rather than a date, each weekday is mapped onto a fixed reference date in one week, and that date carries the weekly repeat rule. The same timetable always exports the same file.
 
+## Filtering
+
+```
+python3 -m timetable filter --day monday --start 09:00 --end 12:00
+python3 -m timetable filter --room "Lab 1"
+python3 -m timetable filter --day monday --room "Lab 1" --start 09:00 --end 14:00
+```
+
+`filter` shows only the classes matching `--day`, `--start`/`--end` (a time range) and/or `--room`. Every option is optional and they combine: only the classes that satisfy all the given filters are shown. The time range is half-open, so a class matches when it overlaps the range; a class that only touches a boundary (for example one ending exactly at `--start`, or starting exactly at `--end`) is not included. `--day` ignores capital letters and `--room` matches exactly. If nothing matches it just says so.
 ## Comparing two timetables
 
 ```bash
@@ -85,6 +96,7 @@ When the timetables are identical it prints `No changes detected. The timetables
 - `timetable/display.py`: printing a day or the week, plus time parsing
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file
+- `timetable/filter.py`: reusable filtering by day, time range and room
 - `timetable/diff.py`: comparing two timetable files
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
