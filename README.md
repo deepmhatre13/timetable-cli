@@ -26,6 +26,7 @@ On Windows, use `python` instead of `python3`.
 | `now` | What's on right now, and what's next |
 | `export [--output FILE]` | Writes a `timetable.ics` calendar file |
 | `add --day --subject --start --end --room` | Adds a class |
+| `diff <first> <second>` | Compares two timetable files and reports what changed |
 
 ## How it's supposed to work
 
@@ -54,12 +55,37 @@ Writes an `.ics` file (default name `timetable.ics`) containing every class as a
 
 Because `timetable.json` only stores a weekday and a time rather than a date, each weekday is mapped onto a fixed reference date in one week, and that date carries the weekly repeat rule. The same timetable always exports the same file.
 
+## Comparing two timetables
+
+```bash
+python3 -m timetable diff timetable.json timetable-new.json
+```
+
+`diff` takes exactly two timetable JSON files and reports what changed between them. It prints three sections — `Added:` (classes only in the second file), `Removed:` (classes only in the first file) and `Modified:` (classes present in both but with changed fields, listed as `Field: old -> new`). Classes are matched by their day and subject rather than their position in the JSON, so reordering entries is never reported as a change. The output is sorted by weekday and start time.
+
+```text
+Timetable changes
+
+Added:
+  Tuesday 14:00-15:00 — Operating Systems — Room 204
+
+Removed:
+  Wednesday 10:00-11:00 — Mathematics — Room 101
+
+Modified:
+  Monday 09:00-10:30 — Data Structures
+    Room: Lab 1 -> Lab 2
+```
+
+When the timetables are identical it prints `No changes detected. The timetables are identical.` The command exits with status `0` when the files match and non-zero when they differ or an input is missing/invalid, so it can be used in scripts. Neither input file is modified.
+
 ## Code
 
 - `timetable/loader.py`: reading and writing `timetable.json`
 - `timetable/display.py`: printing a day or the week, plus time parsing
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file
+- `timetable/diff.py`: comparing two timetable files
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
 
