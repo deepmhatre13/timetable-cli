@@ -28,6 +28,7 @@ On Windows, use `python` instead of `python3`.
 | `export [--output FILE]` | Writes a `timetable.ics` calendar file |
 | `filter [--day --start --end --room]` | Classes matching a day, time range and/or room |
 | `add --day --subject --start --end --room` | Adds a class |
+| `diff <first> <second>` | Compares two timetable files and reports what changed |
 
 ## How it's supposed to work
 
@@ -65,6 +66,29 @@ python3 -m timetable filter --day monday --room "Lab 1" --start 09:00 --end 14:0
 ```
 
 `filter` shows only the classes matching `--day`, `--start`/`--end` (a time range) and/or `--room`. Every option is optional and they combine: only the classes that satisfy all the given filters are shown. The time range is half-open, so a class matches when it overlaps the range; a class that only touches a boundary (for example one ending exactly at `--start`, or starting exactly at `--end`) is not included. `--day` ignores capital letters and `--room` matches exactly. If nothing matches it just says so.
+## Comparing two timetables
+
+```bash
+python3 -m timetable diff timetable.json timetable-new.json
+```
+
+`diff` takes exactly two timetable JSON files and reports what changed between them. It prints three sections — `Added:` (classes only in the second file), `Removed:` (classes only in the first file) and `Modified:` (classes present in both but with changed fields, listed as `Field: old -> new`). Classes are matched by their day and subject rather than their position in the JSON, so reordering entries is never reported as a change. The output is sorted by weekday and start time.
+
+```text
+Timetable changes
+
+Added:
+  Tuesday 14:00-15:00 — Operating Systems — Room 204
+
+Removed:
+  Wednesday 10:00-11:00 — Mathematics — Room 101
+
+Modified:
+  Monday 09:00-10:30 — Data Structures
+    Room: Lab 1 -> Lab 2
+```
+
+When the timetables are identical it prints `No changes detected. The timetables are identical.` The command exits with status `0` when the files match and non-zero when they differ or an input is missing/invalid, so it can be used in scripts. Neither input file is modified.
 
 ## Code
 
@@ -73,6 +97,7 @@ python3 -m timetable filter --day monday --room "Lab 1" --start 09:00 --end 14:0
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file
 - `timetable/filter.py`: reusable filtering by day, time range and room
+- `timetable/diff.py`: comparing two timetable files
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
 
