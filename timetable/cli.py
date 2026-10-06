@@ -8,6 +8,7 @@ from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.display import render_day, render_week, WEEKDAYS
 from timetable.now import current_now, render_now
 from timetable.export import export_ics
+from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
 
 
 def cmd_show(args):
@@ -49,6 +50,24 @@ def cmd_add(args):
     print(f"Successfully added '{args.subject}' to {args.day.capitalize()}.")
 
 
+def cmd_diff(args):
+    """Compares two timetable files and reports what changed.
+
+    Exits with status 1 when the timetables differ and 0 when they are
+    identical, so the command can be used in scripts.
+    """
+    try:
+        first = load_for_diff(args.first)
+        second = load_for_diff(args.second)
+    except DiffError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    result = diff_timetables(first, second)
+    render_diff(result)
+    sys.exit(1 if result.has_changes else 0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Timetable CLI - Manage and view your weekly schedule")
     parser.add_argument("--file", default=DEFAULT_FILEPATH, help="Path to timetable.json")
@@ -80,6 +99,15 @@ def main():
     p_add.add_argument("--end", required=True, help="End time (HH:MM)")
     p_add.add_argument("--room", required=True, help="Room/location")
     p_add.set_defaults(func=cmd_add)
+
+    # diff
+    p_diff = subparsers.add_parser(
+        "diff",
+        help="Compare two timetable files and report what changed",
+    )
+    p_diff.add_argument("first", help="Path to the first timetable JSON file")
+    p_diff.add_argument("second", help="Path to the second timetable JSON file")
+    p_diff.set_defaults(func=cmd_diff)
 
     args = parser.parse_args()
     if not args.command:
