@@ -33,7 +33,8 @@ def calc_duration(start, end):
 
 def render_day(data, day):
     """Renders schedule for a single day."""
-    slots = data.get(day, [])
+    day_key = day.lower()
+    slots = sorted(data.get(day_key, []), key=lambda s: s.get("start", ""))
 
     day_name = day.capitalize()
     print(f"\n📅 Timetable for {day_name}:")
@@ -58,7 +59,7 @@ def render_week(data):
     print("=" * 65)
 
     for day in WEEKDAYS:
-        slots = data.get(day, [])
+        slots = sorted(data.get(day, []), key=lambda s: s.get("start", ""))
         print(f"\n● {day.capitalize()} ({len(slots)} classes):")
         if not slots:
             print("    No classes.")

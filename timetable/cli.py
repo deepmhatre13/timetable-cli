@@ -12,9 +12,65 @@ from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
 
 
+def validate_day(day_str):
+    """Validates that day_str is a recognized weekday, ignoring case.
+    
+    Returns the lowercased weekday name.
+    Exits with error listing valid days if invalid.
+    """
+    day = day_str.lower()
+    if day not in WEEKDAYS:
+        valid_days = ", ".join(WEEKDAYS)
+        print(f"Error: '{day_str}' is not a valid day. Valid days are: {valid_days}", file=sys.stderr)
+        sys.exit(1)
+    return day
+
+
+def parse_time(time_str):
+    """Parses and validates 24-hour HH:MM time string, returning minutes from midnight.
+    
+    Exits with error if format or time is invalid.
+    """
+    parts = time_str.split(":")
+    if len(parts) != 2 or len(parts[0]) != 2 or len(parts[1]) != 2:
+        print(f"Error: Invalid time format '{time_str}'. Time must be 24-hour HH:MM.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+    except ValueError:
+        print(f"Error: Non-numeric time value in '{time_str}'.", file=sys.stderr)
+        sys.exit(1)
+
+    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+        print(f"Error: Time '{time_str}' does not exist. Hours must be 00-23 and minutes 00-59.", file=sys.stderr)
+        sys.exit(1)
+
+    return hours * 60 + minutes
+
+
+def check_clash(slots, start_min, end_min):
+    """Checks whether the new [start_min, end_min) interval overlaps with any existing slot.
+    
+    Returns the clashing slot dictionary, or None.
+    """
+    for slot in slots:
+        try:
+            sh, sm = map(int, slot["start"].split(":"))
+            eh, em = map(int, slot["end"].split(":"))
+            slot_start = sh * 60 + sm
+            slot_end = eh * 60 + em
+            if max(start_min, slot_start) < min(end_min, slot_end):
+                return slot
+        except Exception:
+            continue
+    return None
+
+
 def cmd_show(args):
+    day = validate_day(args.day)
     data = load_timetable(args.file)
-    render_day(data, args.day)
+    render_day(data, day)
 
 
 def cmd_week(args):
@@ -46,11 +102,27 @@ def cmd_export(args):
 
 
 def cmd_add(args):
-    data = load_timetable(args.file)
-    day = args.day.lower()
+    day = validate_day(args.day)
+    start_min = parse_time(args.start)
+    end_min = parse_time(args.end)
 
+    if end_min <= start_min:
+        print(f"Error: Class ends before or at its start time ({args.start} to {args.end}).", file=sys.stderr)
+        sys.exit(1)
+
+    data = load_timetable(args.file)
     if day not in data:
         data[day] = []
+
+    clashing_slot = check_clash(data[day], start_min, end_min)
+    if clashing_slot:
+        clash_name = clashing_slot.get("subject", "Existing class")
+        clash_time = f"{clashing_slot.get('start')} - {clashing_slot.get('end')}"
+        print(
+            f"Error: Class overlaps with '{clash_name}' ({clash_time}) on {day.capitalize()}.",
+            file=sys.stderr
+        )
+        sys.exit(1)
 
     data[day].append({
         "subject": args.subject,
@@ -58,9 +130,10 @@ def cmd_add(args):
         "end": args.end,
         "room": args.room
     })
+    data[day].sort(key=lambda s: s.get("start", ""))
 
     save_timetable(data, args.file)
-    print(f"Successfully added '{args.subject}' to {args.day.capitalize()}.")
+    print(f"Successfully added '{args.subject}' to {day.capitalize()}.")
 
 
 def cmd_diff(args):
@@ -82,6 +155,13 @@ def cmd_diff(args):
 
 
 def main():
+    if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="Timetable CLI - Manage and view your weekly schedule")
     parser.add_argument("--file", default=DEFAULT_FILEPATH, help="Path to timetable.json")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
