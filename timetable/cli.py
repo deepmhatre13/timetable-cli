@@ -11,6 +11,7 @@ from timetable.now import current_now, render_now
 from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
 from timetable.conflicts import find_conflicts, render_conflicts
+from timetable.stats import compute_stats, render_stats
 
 
 def validate_day(day_str):
@@ -175,6 +176,30 @@ def cmd_conflicts(args):
     sys.exit(1 if conflicts else 0)
 
 
+def cmd_stats(args):
+    """Prints aggregate statistics for the whole timetable."""
+    filepath = args.file if args.file is not None else DEFAULT_FILEPATH
+    target = Path(filepath)
+
+    if not target.exists():
+        print(f"Error: Timetable file not found: {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = load_timetable(target)
+    except Exception as exc:
+        print(f"Error: cannot read {filepath}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        stats = compute_stats(data)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    render_stats(stats)
+
+
 def main():
     if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         try:
@@ -243,6 +268,19 @@ def main():
         help="Path to timetable JSON file (defaults to timetable.json)",
     )
     p_conflicts.set_defaults(func=cmd_conflicts)
+
+    # stats
+    p_stats = subparsers.add_parser(
+        "stats",
+        help="Compute and print aggregate statistics for the whole timetable",
+    )
+    p_stats.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="Path to timetable JSON file (defaults to timetable.json)",
+    )
+    p_stats.set_defaults(func=cmd_stats)
 
     args = parser.parse_args()
     if not args.command:
