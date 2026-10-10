@@ -303,4 +303,3 @@ class TestMergeCLI(MergeTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

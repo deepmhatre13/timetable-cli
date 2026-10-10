@@ -13,7 +13,7 @@ class MergeError(Exception):
 
 def validate_timetable_structure(data, source_name="timetable"):
     """Validates that ``data`` follows the timetable structure conventions.
-    
+
     Structure rules:
     - Must be a JSON object (dict).
     - Keys should ideally be string day names.
@@ -43,7 +43,7 @@ def validate_timetable_structure(data, source_name="timetable"):
 
 def load_timetable_for_merge(path):
     """Reads and validates a timetable JSON file.
-    
+
     Raises MergeError if the file is missing, cannot be read, contains invalid JSON,
     or fails structural validation.
     """
@@ -93,13 +93,13 @@ def parse_start_minutes(time_str):
 
 def merge_timetables(first, second):
     """Combines two timetable dictionaries into a single timetable structure.
-    
+
     - Preserves all canonical weekdays and any extra keys present.
     - Preserves unique classes.
     - Removes duplicate identical classes.
     - Orders output deterministically by canonical weekday (monday..sunday) then start time.
     - Detects overlapping classes on the same day.
-    
+
     Returns:
         (merged_data, conflicts)
     """
@@ -164,4 +164,3 @@ def render_merge_conflicts(conflicts):
         lines.append(f"  • {b.get('start')} - {b.get('end')} : {b.get('subject')} [{b.get('room', 'No Room')}]")
     lines.append("\n" + "=" * 65)
     return "\n".join(lines)
-
