@@ -49,6 +49,14 @@ from timetable.import_csv import (
     render_plan,
     save_timetable_atomic,
 )
+from timetable.undo import (
+    HistoryFileError,
+    NoOpError,
+    commit_mutation,
+    load_journal,
+    redo_last,
+    undo_last,
+)
 
 def validate_day(day_str):
     """Validates that day_str is a recognized weekday, ignoring case.
@@ -275,6 +283,50 @@ def cmd_restore(args):
     return 0
 
 
+def cmd_undo(args):
+    """Undo the latest recorded mutation of the active timetable."""
+    try:
+        entry = undo_last(Path(args.file))
+    except HistoryFileError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Undid {entry['operation']} on '{args.file}' "
+        f"(recorded {entry['at']})."
+    )
+    return 0
+
+
+def cmd_redo(args):
+    """Redo the latest undone mutation of the active timetable."""
+    try:
+        entry = redo_last(Path(args.file))
+    except HistoryFileError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Redid {entry['operation']} on '{args.file}' "
+        f"(recorded {entry['at']})."
+    )
+    return 0
+
+
+def cmd_undo_history(args):
+    """List recorded undo entries (operation type and timestamp only)."""
+    try:
+        journal = load_journal(Path(args.file))
+    except HistoryFileError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    entries = journal["undo"]
+    if not entries:
+        print("No recorded changes.")
+        return 0
+    for entry in reversed(entries):
+        print(f"{entry['id']}  {entry['at']}  {entry['operation']}")
+    return 0
+
+
 def cmd_export(args):
     data = load_timetable(args.file)
     export_ics(data, args.output)
@@ -313,15 +365,21 @@ def cmd_add(args):
     })
     data[day].sort(key=lambda s: s.get("start", ""))
 
-    # Snapshot the timetable as it was *before* this addition (so restoring
-    # undoes it), then write atomically.  Validation above already succeeded,
-    # so the write is genuinely attempted here.
-    _write_timetable_with_snapshot(
-        data,
+    # Snapshot the timetable as it was *before* this addition (kept for the
+    # existing `history` browser), then record the mutation transactionally:
+    # the shared helper validates the proposed state, writes the undo journal
+    # first, then atomically replaces the timetable.  Validation above already
+    # succeeded, so the write is genuinely attempted here.
+    _save_snapshot_before_file_write(
+        previous_state,
         filepath=Path(args.file),
         operation="add",
-        previous=previous_state,
     )
+    try:
+        commit_mutation(Path(args.file), "add", data)
+    except (HistoryFileError, NoOpError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     print(f"Successfully added '{args.subject}' to {day.capitalize()}.")
 
 
@@ -410,11 +468,10 @@ def cmd_import_csv(args):
 
     updated = apply_import(timetable_data, plan)
     try:
-        save_timetable_atomic(updated, args.file)
-    except OSError as exc:
-        print(f"Error: Could not write timetable '{args.file}': {exc}", file=sys.stderr)
+        commit_mutation(Path(args.file), "import-csv", updated)
+    except (HistoryFileError, NoOpError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
-
     print(render_plan(plan))
     print(f"Successfully imported {len(plan.new_classes)} class(es) into '{args.file}'.")
     sys.exit(0)
@@ -460,25 +517,25 @@ def cmd_merge(args):
         sys.exit(1)
 
     if output_path:
-        previous_state = None
         output_file = Path(output_path)
+        # Keep the existing `history` snapshot when the output file already
+        # holds readable content (matches the previous behavior).
         if output_file.exists():
             try:
                 previous_state = load_timetable(output_file)
             except (OSError, ValueError):
                 previous_state = None
-
-        if previous_state is None:
-            # Nothing meaningful to preserve (new or unreadable output file);
-            # just write the merged data atomically.
-            _atomic_save_timetable(merged_data, output_file)
-        else:
-            _write_timetable_with_snapshot(
-                merged_data,
-                filepath=output_file,
-                operation="merge",
-                previous=previous_state,
-            )
+            if previous_state is not None:
+                _save_snapshot_before_file_write(
+                    previous_state,
+                    filepath=output_file,
+                    operation="merge",
+                )
+        try:
+            commit_mutation(output_file, "merge", merged_data)
+        except (HistoryFileError, NoOpError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"Successfully merged timetables into '{args.output}'.")
     else:
         print("Successfully merged timetables (dry run, no --output specified).")
@@ -638,6 +695,27 @@ def main():
         "(defaults to .timetable-history next to the timetable).",
     )
     p_restore.set_defaults(func=cmd_restore)
+
+    # undo
+    p_undo = subparsers.add_parser(
+        "undo",
+        help="Undo the latest recorded change to the timetable",
+    )
+    p_undo.set_defaults(func=cmd_undo)
+
+    # redo
+    p_redo = subparsers.add_parser(
+        "redo",
+        help="Redo the latest undone change to the timetable",
+    )
+    p_redo.set_defaults(func=cmd_redo)
+
+    # undo-history
+    p_undo_history = subparsers.add_parser(
+        "undo-history",
+        help="List recorded undo entries for the timetable",
+    )
+    p_undo_history.set_defaults(func=cmd_undo_history)
 
     args = parser.parse_args()
     if not args.command:
