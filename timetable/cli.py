@@ -12,6 +12,7 @@ from typing import Any, Dict
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.display import render_day, render_week, WEEKDAYS
 from timetable.filter import filter_timetable, render_filter
+from timetable.free import find_free_slots, render_free_slots
 from timetable.now import current_now, render_now
 from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
@@ -131,6 +132,39 @@ def cmd_filter(args):
         room=args.room,
     )
     render_filter(results, day=args.day, start=args.start, end=args.end, room=args.room)
+
+
+def cmd_free(args):
+    if args.duration <= 0:
+        print("Error: --duration must be a positive integer number of minutes.", file=sys.stderr)
+        sys.exit(1)
+
+    day = validate_day(args.day) if args.day is not None else None
+    start_min = parse_time(args.start) if args.start is not None else None
+    end_min = parse_time(args.end) if args.end is not None else None
+
+    if start_min is not None and end_min is not None and start_min >= end_min:
+        print(
+            f"Error: --start ({args.start}) must be earlier than --end ({args.end}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    data = load_timetable(args.file)
+    slots = find_free_slots(
+        data,
+        duration_minutes=args.duration,
+        days=day,
+        start=args.start,
+        end=args.end,
+    )
+    render_free_slots(
+        slots,
+        duration_minutes=args.duration,
+        days=day,
+        start=args.start,
+        end=args.end,
+    )
 
 
 def _history_dir_for(args) -> Path:
@@ -518,6 +552,22 @@ def main():
     p_filter.add_argument("--end", help="Range end time (HH:MM)")
     p_filter.add_argument("--room", help="Room/location to match exactly")
     p_filter.set_defaults(func=cmd_filter)
+
+    # free
+    p_free = subparsers.add_parser(
+        "free",
+        help="Find free intervals that fit a requested duration",
+    )
+    p_free.add_argument(
+        "--duration",
+        type=int,
+        required=True,
+        help="Minimum length of a free interval to report, in minutes (positive integer)",
+    )
+    p_free.add_argument("--day", help="Restrict the search to one weekday (e.g. monday, tuesday)")
+    p_free.add_argument("--start", help="Working window start time (HH:MM)")
+    p_free.add_argument("--end", help="Working window end time (HH:MM)")
+    p_free.set_defaults(func=cmd_free)
 
     # export
     p_export = subparsers.add_parser("export", help="Export the timetable as an .ics calendar file")
