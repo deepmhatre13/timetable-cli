@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import datetime
 import json
 import os
 import sys
@@ -48,6 +49,10 @@ from timetable.import_csv import (
     plan_import,
     render_plan,
     save_timetable_atomic,
+)
+from timetable.import_ics import (
+    plan_ics_import,
+    render_ics_plan,
 )
 
 def validate_day(day_str):
@@ -420,6 +425,87 @@ def cmd_import_csv(args):
     sys.exit(0)
 
 
+def cmd_import_ics(args):
+    """Imports classes from an iCalendar (.ics) file with recurrence expansion."""
+    from_date = None
+    to_date = None
+
+    if args.from_date:
+        try:
+            from_date = datetime.date.fromisoformat(args.from_date)
+        except ValueError:
+            print(f"Error: Invalid --from date '{args.from_date}'; expected YYYY-MM-DD.", file=sys.stderr)
+            sys.exit(1)
+
+    if args.to_date:
+        try:
+            to_date = datetime.date.fromisoformat(args.to_date)
+        except ValueError:
+            print(f"Error: Invalid --to date '{args.to_date}'; expected YYYY-MM-DD.", file=sys.stderr)
+            sys.exit(1)
+
+    # Defaults: if not specified, default to the current semester/year or require explicit dates
+    # When omitted, default to today and 90 days ahead
+    if from_date is None:
+        from_date = datetime.date.today()
+    if to_date is None:
+        to_date = from_date + datetime.timedelta(days=90)
+
+    if to_date < from_date:
+        print(
+            f"Error: --to date ({to_date}) cannot be earlier than --from date ({from_date}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        timetable_data = load_timetable_for_import(args.file)
+        plan = plan_ics_import(
+            args.ics_file,
+            timetable_data,
+            from_date=from_date,
+            to_date=to_date,
+            timezone_name=args.timezone,
+        )
+    except ImportError_ as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not plan.accepted:
+        print(render_ics_plan(plan, dry_run=args.dry_run), file=sys.stderr)
+        if plan.invalid_records:
+            print("Error: Could not import ICS due to validation errors.", file=sys.stderr)
+        else:
+            print("Error: Could not import ICS due to scheduling conflicts.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.dry_run:
+        print(render_ics_plan(plan, dry_run=True))
+        print("Dry run complete. No files were modified.")
+        sys.exit(0)
+
+    # Convert plan to timetable data structure using apply_import
+    # IcsImportPlan new_classes is in the same format: (line, day, slot)
+    updated = apply_import(timetable_data, plan)
+    previous_state = copy.deepcopy(timetable_data)
+
+    target_file = Path(args.file)
+    try:
+        _write_timetable_with_snapshot(
+            updated,
+            filepath=target_file,
+            operation="import-ics",
+            previous=previous_state,
+        )
+    except OSError as exc:
+        print(f"Error: Could not write timetable '{args.file}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(render_ics_plan(plan))
+    print(f"Successfully imported {len(plan.new_classes)} class(es) into '{args.file}'.")
+    sys.exit(0)
+
+
 def cmd_merge(args):
     """Merges two timetable JSON files with conflict detection."""
     try:
@@ -580,6 +666,33 @@ def main():
         help="Validate and preview the import without modifying the timetable",
     )
     p_import_csv.set_defaults(func=cmd_import_csv)
+
+    # import-ics
+    p_import_ics = subparsers.add_parser(
+        "import-ics",
+        help="Import classes from an iCalendar (.ics) file with recurrence expansion",
+    )
+    p_import_ics.add_argument("ics_file", help="Path to the .ics file to import")
+    p_import_ics.add_argument(
+        "--from",
+        dest="from_date",
+        help="Start date for recurrence expansion (YYYY-MM-DD, inclusive, default: today)",
+    )
+    p_import_ics.add_argument(
+        "--to",
+        dest="to_date",
+        help="End date for recurrence expansion (YYYY-MM-DD, inclusive, default: 90 days from start)",
+    )
+    p_import_ics.add_argument(
+        "--timezone",
+        help="Target IANA timezone (e.g. Asia/Kolkata, UTC) for converting timestamps",
+    )
+    p_import_ics.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and preview the import without modifying the timetable",
+    )
+    p_import_ics.set_defaults(func=cmd_import_ics)
 
     # merge
     p_merge = subparsers.add_parser(
