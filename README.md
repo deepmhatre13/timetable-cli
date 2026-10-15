@@ -33,6 +33,7 @@ On Windows, use `python` instead of `python3`.
 | `diff <first> <second>` | Compares two timetable files and reports what changed |
 | `merge <first> <second> [--output OUT] [--force]` | Combines two timetables into one with conflict detection |
 | `import-csv <file> [--dry-run]` | Imports classes from a CSV file with validation, duplicate detection and conflict checks |
+| `optimize [--config FILE] [--dry-run] [--apply]` | Optimizes schedule to reduce daily gaps, span, and balance workload |
 
 ## How it's supposed to work
 
@@ -178,6 +179,68 @@ python3 -m timetable restore snap-20260101120000000000-000000
 - **Snapshot layout**: each snapshot is a directory `<id>/` containing `timetable.json` and `.metadata.json`. The metadata records the id, creation time, source timetable path, operation, and a SHA-256 checksum of the timetable bytes; `list`/`show`/`restore` verify the checksum before trusting the data.
 - **Retention**: the newest `TIMETABLE_HISTORY_LIMIT` snapshots are kept (default `10`). Set the environment variable to a positive integer to change it, e.g. `$env:TIMETABLE_HISTORY_LIMIT = "20"` (PowerShell) or `TIMETABLE_HISTORY_LIMIT=20 python3 -m timetable history list` (bash). Older snapshots are pruned after each save and restore; `restore-previous` snapshots are protected from pruning so the pre-restore state stays recoverable.
 
+## Timetable Optimization
+ 
+```bash
+python3 -m timetable optimize --dry-run
+python3 -m timetable optimize --apply
+python3 -m timetable optimize --config opt_config.json --dry-run
+```
+
+`optimize` uses a constraint-based search algorithm with configurable multi-objective scoring to improve timetable compactness, eliminate idle gaps, and balance workload across eligible weekdays.
+
+### Objectives and Scoring
+
+The optimizer scores candidates using a composite objective function (lower score is better):
+
+1. **Minimize daily gaps**: Reduces idle time between consecutive classes on the same day.
+2. **Minimize daily span**: Reduces the total elapsed duration from the first class's start to the last class's end.
+3. **Balance workload**: Distributes class counts evenly across eligible weekdays by minimizing count variance.
+4. **Minimize changes**: Penalizes moving classes to different days or shifting times unnecessarily, ensuring improvements justify any alterations.
+
+Default weights: `gaps=1.0`, `span=0.5`, `balance=20.0`, `changes=15.0`. These can be overridden via CLI flags (`--weight-gaps`, `--weight-span`, `--weight-balance`, `--weight-changes`) or a configuration file.
+
+### Hard Constraints vs Preferences
+
+Mandatory constraints are strictly enforced before any candidate is scored:
+- **No overlapping classes**: Two classes can never overlap in time on the same weekday (including overnight interval handling).
+- **Fixed / immovable classes**: Classes specified as fixed (via `--fixed "Math,Physics"` or in config) remain untouched in day, start time, and end time.
+- **Allowed weekdays**: Classes are only scheduled on eligible weekdays (via `--allowed-days` or config).
+- **Availability windows & prohibited ranges**: Configurable per-weekday time limits and blocked intervals (e.g. lunch periods).
+- **Class identity & duration**: Every class preserves its duration, subject, room, and metadata.
+
+### Configuration Format
+
+An optional JSON configuration file can define weights, fixed subjects, allowed days, and constraints:
+
+```json
+{
+  "weights": {
+    "gaps": 1.0,
+    "span": 0.5,
+    "balance": 20.0,
+    "changes": 15.0
+  },
+  "fixed_classes": ["Mathematics"],
+  "allowed_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+  "day_availability": {
+    "Monday": ["09:00", "17:00"]
+  },
+  "prohibited_ranges": {
+    "Monday": [["12:00", "13:00"]]
+  },
+  "max_iterations": 1000,
+  "seed": 42
+}
+```
+
+### Safety, Dry-Run, and Stale Result Protection
+
+- **Dry-run**: By default or with `--dry-run`, `optimize` previews proposed improvements with per-entry change explanations without writing to disk or creating history entries.
+- **Explicit application**: Changes are persisted only when `--apply` is specified.
+- **Stale result rejection**: If the timetable file was modified concurrently while the optimizer was running, the proposal is safely aborted without overwriting.
+- **Atomic persistence and history**: Applied optimizations are written atomically and recorded as an `optimize` snapshot in `.timetable-history/`.
+
 ## Code
 
 - `timetable/loader.py`: reading and writing `timetable.json`
@@ -188,8 +251,11 @@ python3 -m timetable restore snap-20260101120000000000-000000
 - `timetable/diff.py`: comparing two timetable files
 - `timetable/merge.py`: combining timetables with deduplication and conflict detection
 - `timetable/import_csv.py`: parsing, validating, planning and safely writing CSV imports
+- `timetable/optimizer_config.py`: optimization configuration and constraint representations
+- `timetable/optimizer_scoring.py`: multi-objective metrics and scoring engine
+- `timetable/optimizer_engine.py`: bounded hill-climbing search and change explanations
 - `timetable/cli.py`: the commands
-- `tests/`: tests, run with `python3 -m unittest discover tests`
+- `tests/`: tests, run with `python3 -m unittest discover tests` or `pytest`
 
 
 ## Contributing

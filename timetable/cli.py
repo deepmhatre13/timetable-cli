@@ -40,6 +40,7 @@ from timetable.merge import (
     load_timetable_for_merge,
     merge_timetables,
     render_merge_conflicts,
+    validate_timetable_structure,
 )
 from timetable.import_csv import (
     ImportError_,
@@ -48,6 +49,20 @@ from timetable.import_csv import (
     plan_import,
     render_plan,
     save_timetable_atomic,
+)
+from timetable.optimizer_config import (
+    ConfigurationError,
+    InfeasibleScheduleError,
+    ObjectiveWeights,
+    OptimizationConfig,
+    OptimizationError,
+    TimeRange,
+    load_optimization_config,
+)
+from timetable.optimizer_engine import (
+    OptimizationResult,
+    is_schedule_valid,
+    optimize_timetable,
 )
 
 def validate_day(day_str):
@@ -486,6 +501,162 @@ def cmd_merge(args):
     sys.exit(0)
 
 
+def cmd_optimize(args):
+    """Optimizes the weekly timetable according to configurable constraints and objectives."""
+    timetable_file = Path(args.file)
+    if not timetable_file.exists():
+        print(f"Error: Timetable file not found: {timetable_file}", file=sys.stderr)
+        sys.exit(1)
+
+    # 1. Load configuration
+    try:
+        if args.config:
+            config = load_optimization_config(args.config)
+        else:
+            config = OptimizationConfig()
+
+        # Command-line overrides
+        if args.max_iterations is not None:
+            if args.max_iterations < 1:
+                raise ConfigurationError(f"max_iterations must be a positive integer, got {args.max_iterations}")
+            config.max_iterations = args.max_iterations
+
+        if args.seed is not None:
+            config.seed = args.seed
+
+        if args.fixed:
+            for item in args.fixed:
+                for sub in item.split(","):
+                    if sub.strip():
+                        config.fixed_classes.add(sub.strip().lower())
+
+        if args.allowed_days:
+            days = []
+            for item in args.allowed_days:
+                for d in item.split(","):
+                    d_norm = d.strip().lower()
+                    if d_norm not in WEEKDAYS:
+                        raise ConfigurationError(f"Invalid weekday '{d}' in --allowed-days")
+                    if d_norm not in days:
+                        days.append(d_norm)
+            config.allowed_days = days
+
+        # Weights override
+        w = config.weights
+        new_gaps = args.weight_gaps if args.weight_gaps is not None else w.gaps
+        new_span = args.weight_span if args.weight_span is not None else w.span
+        new_balance = args.weight_balance if args.weight_balance is not None else w.balance
+        new_changes = args.weight_changes if args.weight_changes is not None else w.changes
+        config.weights = ObjectiveWeights(
+            gaps=new_gaps,
+            span=new_span,
+            balance=new_balance,
+            changes=new_changes,
+        )
+        config.validate()
+    except ConfigurationError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Read active file content for stale check
+    try:
+        raw_initial_bytes = timetable_file.read_bytes()
+    except OSError as exc:
+        print(f"Error reading {timetable_file}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        source_data = json.loads(raw_initial_bytes.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"Error: Invalid JSON in {timetable_file}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(source_data, dict):
+        print(f"Error: Timetable in {timetable_file} must be a JSON object", file=sys.stderr)
+        sys.exit(1)
+
+    # 2. Run optimization
+    result = optimize_timetable(source_data, config)
+
+    # 3. Print report
+    print("\n=== Timetable Optimization Report ===")
+    print(f"Search Status: {result.search_status}")
+    print(f"Iterations Evaluated: {result.iterations_evaluated}")
+    print(f"Optimality Proven: {'Yes' if result.is_optimal_proven else 'No'}")
+    print(f"\nOriginal {result.original_score.format_summary()}")
+    print(f"Proposed {result.proposed_score.format_summary()}")
+
+    if result.changes:
+        print(f"\nProposed Changes ({len(result.changes)}):")
+        for ch in result.changes:
+            print(
+                f"  • {ch.subject}: {ch.original_day} {ch.original_start}-{ch.original_end} -> "
+                f"{ch.new_day} {ch.new_start}-{ch.new_end}"
+            )
+            print(f"    Reason: {ch.reason}")
+    else:
+        print("\nNo schedule changes proposed.")
+
+    if result.search_status == "infeasible":
+        print(f"\nError: {result.message}", file=sys.stderr)
+        sys.exit(1)
+
+    # 4. Handle persistence if --apply was requested
+    if args.apply:
+        if not result.has_improvement:
+            print("\nNo timetable improvement to apply. File remains unchanged.")
+            sys.exit(0)
+
+        # Stale result protection: check if timetable on disk changed while optimization ran
+        try:
+            current_bytes = timetable_file.read_bytes()
+        except OSError as exc:
+            print(f"Error: Could not re-read {timetable_file}: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        if current_bytes != raw_initial_bytes:
+            print(
+                f"Error: Timetable file '{timetable_file}' was modified concurrently. "
+                "Rejecting stale optimization result.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Validate proposed timetable against mandatory constraints
+        valid, err_msg = is_schedule_valid(result.proposed_timetable, config)
+        if not valid:
+            print(f"Error: Proposed timetable failed final validation: {err_msg}", file=sys.stderr)
+            sys.exit(1)
+
+        # Re-validate structure
+        try:
+            validate_timetable_structure(result.proposed_timetable, str(timetable_file))
+        except MergeError as exc:
+            print(f"Error: Proposed timetable structure is invalid: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        # Snapshot and atomic write
+        try:
+            _write_timetable_with_snapshot(
+                result.proposed_timetable,
+                filepath=timetable_file,
+                operation="optimize",
+                previous=source_data,
+            )
+        except Exception as exc:
+            print(f"Error saving optimized timetable: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"\nSuccessfully applied optimization to '{timetable_file}'.")
+    else:
+        if args.dry_run:
+            print("\nDry run complete. No files were modified.")
+        else:
+            print("\nPreview complete. To apply these changes, rerun with --apply.")
+
+    sys.exit(0)
+
+
 def main():
     if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         try:
@@ -638,6 +809,75 @@ def main():
         "(defaults to .timetable-history next to the timetable).",
     )
     p_restore.set_defaults(func=cmd_restore)
+
+    # optimize
+    p_optimize = subparsers.add_parser(
+        "optimize",
+        help="Optimize timetable schedule to minimize gaps, span, and balance workload",
+    )
+    p_optimize.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to JSON optimization configuration file",
+    )
+    p_optimize.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview proposed optimization changes without modifying files",
+    )
+    p_optimize.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply and safely persist proposed optimization changes to the timetable",
+    )
+    p_optimize.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="Maximum search iterations (default: 1000)",
+    )
+    p_optimize.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for deterministic optimization (default: 42)",
+    )
+    p_optimize.add_argument(
+        "--fixed",
+        action="append",
+        help="Subject names to keep fixed (comma-separated or multiple flags)",
+    )
+    p_optimize.add_argument(
+        "--allowed-days",
+        action="append",
+        help="Weekdays eligible for class scheduling (comma-separated or multiple flags)",
+    )
+    p_optimize.add_argument(
+        "--weight-gaps",
+        type=float,
+        default=None,
+        help="Weight for daily gaps minimization objective",
+    )
+    p_optimize.add_argument(
+        "--weight-span",
+        type=float,
+        default=None,
+        help="Weight for daily span minimization objective",
+    )
+    p_optimize.add_argument(
+        "--weight-balance",
+        type=float,
+        default=None,
+        help="Weight for workload balance objective",
+    )
+    p_optimize.add_argument(
+        "--weight-changes",
+        type=float,
+        default=None,
+        help="Weight for schedule change minimization penalty",
+    )
+    p_optimize.set_defaults(func=cmd_optimize)
 
     args = parser.parse_args()
     if not args.command:
