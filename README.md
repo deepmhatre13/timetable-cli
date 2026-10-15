@@ -12,6 +12,8 @@ python3 -m timetable week
 python3 -m timetable now
 python3 -m timetable export
 python3 -m timetable filter --day monday --start 09:00 --end 12:00
+python3 -m timetable free --duration 60
+python3 -m timetable free --duration 120 --day monday --start 09:00 --end 17:00
 python3 -m timetable add --day friday --subject "Maths" --start 09:00 --end 10:00 --room "Room 101"
 python3 -m timetable import-csv semester.csv --dry-run
 python3 -m timetable import-csv semester.csv
@@ -29,11 +31,17 @@ On Windows, use `python` instead of `python3`.
 | `now` | What's on right now, and what's next |
 | `export [--output FILE]` | Writes a `timetable.ics` calendar file |
 | `filter [--day --start --end --room]` | Classes matching a day, time range and/or room |
+| `free --duration N [--day --start --end]` | Free time slots at least N minutes long |
 | `add --day --subject --start --end --room` | Adds a class |
 | `diff <first> <second>` | Compares two timetable files and reports what changed |
 | `merge <first> <second> [--output OUT] [--force]` | Combines two timetables into one with conflict detection |
 | `import-csv <file> [--dry-run]` | Imports classes from a CSV file with validation, duplicate detection and conflict checks |
 | `import-ics <file> [--from --to --timezone --dry-run]` | Imports classes from an iCalendar (.ics) file with recurrence expansion, duplicate detection and conflict checks |
+
+| `undo` | Undoes the most recent timetable change |
+| `redo` | Redoes the most recently undone timetable change |
+| `undo-history` | Lists recorded undo entries for the timetable |
+
 
 ## How it's supposed to work
 
@@ -71,6 +79,25 @@ python3 -m timetable filter --day monday --room "Lab 1" --start 09:00 --end 14:0
 ```
 
 `filter` shows only the classes matching `--day`, `--start`/`--end` (a time range) and/or `--room`. Every option is optional and they combine: only the classes that satisfy all the given filters are shown. The time range is half-open, so a class matches when it overlaps the range; a class that only touches a boundary (for example one ending exactly at `--start`, or starting exactly at `--end`) is not included. `--day` ignores capital letters and `--room` matches exactly. If nothing matches it just says so.
+
+## Finding free time
+
+```bash
+python3 -m timetable free --duration 60
+python3 -m timetable free --duration 120 --day monday --start 09:00 --end 17:00
+python3 -m timetable free --duration 30 --day MONDAY
+```
+
+`free` finds every stretch of the day when you have nothing scheduled that is at least `--duration` minutes long.
+
+- `--duration N` is required and must be a positive whole number of minutes; `0` or a negative value is an error.
+- `--day` restricts the search to one weekday (capital letters ignored). Without it, all seven days are searched in canonical order, Monday to Sunday.
+- `--start` and `--end` set the working window to search within, as 24-hour `HH:MM` times. They default to the full day (`00:00` to `24:00`). `--start` must be earlier than `--end`, and a malformed or non-existent time like `9:30` or `25:99` is an error.
+- Consecutive and overlapping classes are merged into one busy block, so back-to-back classes never leave a phantom gap.
+- Results are printed per day in canonical weekday order, and each day is ordered by start time. Every slot shows its day, start and end time, and its length in minutes.
+- If no interval of the requested length exists, it prints a friendly message and exits with code `0` — that is a valid result, not an error.
+- A missing timetable file is treated as an empty timetable, so `free` reports the whole working window rather than failing.
+
 ## Importing classes from CSV
 
 ```bash
@@ -224,7 +251,53 @@ python3 -m timetable restore snap-20260101120000000000-000000
 - **Inspecting**: `history show <id>` prints the snapshot's timetable in the usual day view without touching the active file.
 - **Restoring**: `history restore <id>` (or the shorter `restore <id>`) replaces the active timetable with the snapshot. Before overwriting, the current contents of the active timetable are saved as a recoverable snapshot with operation `restore-previous`, so nothing is ever lost by restoring. A missing or corrupt snapshot raises an error and leaves the active timetable untouched. The write is atomic, so a failure mid-write cannot leave a truncated file.
 - **Snapshot layout**: each snapshot is a directory `<id>/` containing `timetable.json` and `.metadata.json`. The metadata records the id, creation time, source timetable path, operation, and a SHA-256 checksum of the timetable bytes; `list`/`show`/`restore` verify the checksum before trusting the data.
-- **Retention**: the newest `TIMETABLE_HISTORY_LIMIT` snapshots are kept (default `10`). Set the environment variable to a positive integer to change it, e.g. `$env:TIMETABLE_HISTORY_LIMIT = "20"` (PowerShell) or `TIMETABLE_HISTORY_LIMIT=20 python3 -m timetable history list` (bash). Older snapshots are pruned after each save and restore; `restore-previous` snapshots are protected from pruning so the pre-restore state stays recoverable.
+## Undo and Redo
+
+The CLI provides a transactional, snapshot-based undo and redo system for timetable modifications.
+
+```bash
+python3 -m timetable undo
+python3 -m timetable redo
+python3 -m timetable undo-history
+```
+
+Use `--file` to operate on a custom timetable path (e.g. `python3 -m timetable --file custom.json undo`).
+
+### Supported Mutations
+
+All timetable-modifying commands participate in transactional undo and redo:
+- `add`: Adding a new class slot.
+- `import-csv`: Importing classes from a CSV file.
+- `merge --output <file>`: Merging timetables into an output file.
+
+Read-only commands (`show`, `week`, `now`, `filter`, `diff`, `conflicts`, `stats`, `export`, `undo-history`) never create history entries or touch the undo/redo journal.
+
+### Storage and Isolation
+
+- Undo and redo history is stored separately from timetable files under `.timetable-undo/<timetable-filename>.undo-history.json` relative to the resolved timetable path.
+- Each timetable file maintains its own isolated undo and redo journal. Custom timetable paths specified via `--file` resolve to their own independent journal, preventing accidental history mixing.
+- History entries are validated and cross-referenced with the timetable's canonical path so a journal cannot redirect changes to an unrelated timetable file.
+- Existing timetable JSON files require no migration or schema changes.
+
+### Maximum History Size and Pruning
+
+- Default limit: up to 50 undo entries are retained.
+- Custom limit: override by setting the `TIMETABLE_UNDO_LIMIT` environment variable to a positive integer (e.g. `TIMETABLE_UNDO_LIMIT=20`).
+- Pruning policy: when the history limit is exceeded, the oldest undo entries are pruned first, preserving the most recent undo/redo transition chain and semantics.
+
+### Branching and Redo Invalidation
+
+- Undoing an operation moves the state transition to the redo stack.
+- Redoing an undone operation restores the target state and moves the entry back to the undo stack.
+- Applying any new successful mutation after one or more undo operations automatically clears the redo stack.
+- Failed mutations or no-op changes (mutations that produce identical content) leave the redo stack untouched.
+
+### Consistency and Error Recovery
+
+- **Atomic Writes**: Each state transition writes temporary files in the target directory, performs an `fsync`, and atomically replaces the destination (`os.replace`).
+- **Persistence Sequence**: The journal is persisted *before* replacing the timetable file. If writing the timetable fails, the journal update is automatically rolled back. If an unexpected power loss occurs between the journal write and timetable write, the journal contains an extra pre-mutation entry that can safely be undone without corrupting data.
+- **Untrusted Input Validation**: Journals are treated as untrusted input. Schemas, versions, timetable paths, JSON snapshots, and SHA-256 checksums are verified prior to loading. Corrupt or malformed journals are rejected with an error and are never silently overwritten or reset.
+- **Explicit Reset**: To reset a corrupted journal without touching the timetable, run python to invoke `timetable.undo.recreate_journal(filepath)`.
 
 ## Code
 
@@ -233,10 +306,15 @@ python3 -m timetable restore snap-20260101120000000000-000000
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file
 - `timetable/filter.py`: reusable filtering by day, time range and room
+- `timetable/free.py`: calculating and rendering free time slots of a given duration
 - `timetable/diff.py`: comparing two timetable files
 - `timetable/merge.py`: combining timetables with deduplication and conflict detection
 - `timetable/import_csv.py`: parsing, validating, planning and safely writing CSV imports
+
 - `timetable/import_ics.py`: parsing, recurrence expansion, validating, planning and importing iCalendar (.ics) files
+
+- `timetable/history.py`: snapshot management and manual restore browser
+- `timetable/undo.py`: transactional undo and redo journal
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
 

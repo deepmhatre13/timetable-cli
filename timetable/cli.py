@@ -13,6 +13,7 @@ from typing import Any, Dict
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.display import render_day, render_week, WEEKDAYS
 from timetable.filter import filter_timetable, render_filter
+from timetable.free import find_free_slots, render_free_slots
 from timetable.now import current_now, render_now
 from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
@@ -23,6 +24,7 @@ from timetable.history import (
     ENV_HISTORY_LIMIT,
     HistoryError,
     SnapshotCorruptError,
+    SnapshotMismatchError,
     SnapshotNotFoundError,
     WriteFailureError,
     default_retention_limit,
@@ -50,9 +52,19 @@ from timetable.import_csv import (
     render_plan,
     save_timetable_atomic,
 )
+
 from timetable.import_ics import (
     plan_ics_import,
     render_ics_plan,
+
+from timetable.undo import (
+    HistoryFileError,
+    NoOpError,
+    commit_mutation,
+    load_journal,
+    redo_last,
+    undo_last,
+
 )
 
 def validate_day(day_str):
@@ -78,12 +90,13 @@ def parse_time(time_str):
     if len(parts) != 2 or len(parts[0]) != 2 or len(parts[1]) != 2:
         print(f"Error: Invalid time format '{time_str}'. Time must be 24-hour HH:MM.", file=sys.stderr)
         sys.exit(1)
-    try:
-        hours = int(parts[0])
-        minutes = int(parts[1])
-    except ValueError:
+    # int() also accepts signs, spaces and non-ASCII digits ("+6", " 8"), so
+    # require plain 0-9 digits before converting.
+    if not all(part.isascii() and part.isdigit() for part in parts):
         print(f"Error: Non-numeric time value in '{time_str}'.", file=sys.stderr)
         sys.exit(1)
+    hours = int(parts[0])
+    minutes = int(parts[1])
 
     if not (0 <= hours <= 23 and 0 <= minutes <= 59):
         print(f"Error: Time '{time_str}' does not exist. Hours must be 00-23 and minutes 00-59.", file=sys.stderr)
@@ -138,6 +151,39 @@ def cmd_filter(args):
     render_filter(results, day=args.day, start=args.start, end=args.end, room=args.room)
 
 
+def cmd_free(args):
+    if args.duration <= 0:
+        print("Error: --duration must be a positive integer number of minutes.", file=sys.stderr)
+        sys.exit(1)
+
+    day = validate_day(args.day) if args.day is not None else None
+    start_min = parse_time(args.start) if args.start is not None else None
+    end_min = parse_time(args.end) if args.end is not None else None
+
+    if start_min is not None and end_min is not None and start_min >= end_min:
+        print(
+            f"Error: --start ({args.start}) must be earlier than --end ({args.end}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    data = load_timetable(args.file)
+    slots = find_free_slots(
+        data,
+        duration_minutes=args.duration,
+        days=day,
+        start=args.start,
+        end=args.end,
+    )
+    render_free_slots(
+        slots,
+        duration_minutes=args.duration,
+        days=day,
+        start=args.start,
+        end=args.end,
+    )
+
+
 def _history_dir_for(args) -> Path:
     """Return the history directory for the active timetable file."""
     explicit = getattr(args, "history_dir", None)
@@ -162,7 +208,11 @@ def _save_snapshot_before_file_write(
         operation=operation,
         history_dir=history_directory(filepath),
     )
-    prune_snapshots(history_directory(filepath), default_retention_limit())
+    prune_snapshots(
+        history_directory(filepath),
+        default_retention_limit(),
+        timetable=filepath,
+    )
     return snapshot_id
 
 
@@ -224,8 +274,16 @@ def cmd_history(args):
             print("Error: 'history show' requires a snapshot id.", file=sys.stderr)
             return 1
         try:
-            show_snapshot(args.snapshot_id, history_dir)
-        except (SnapshotNotFoundError, SnapshotCorruptError) as exc:
+            show_snapshot(
+                args.snapshot_id,
+                history_dir,
+                timetable=Path(args.file),
+            )
+        except (
+            SnapshotNotFoundError,
+            SnapshotCorruptError,
+            SnapshotMismatchError,
+        ) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         return 0
@@ -246,7 +304,7 @@ def cmd_history(args):
     else:
         limit = default_retention_limit()
 
-    snapshots = list_snapshots(history_dir, limit=limit)
+    snapshots = list_snapshots(history_dir, limit=limit, timetable=Path(args.file))
     if not snapshots:
         print("No snapshots found.")
         return 0
@@ -271,12 +329,65 @@ def cmd_restore(args):
             filepath=Path(args.file),
             history_dir=history_dir,
         )
-    except (SnapshotNotFoundError, SnapshotCorruptError, WriteFailureError) as exc:
+    except (
+        SnapshotNotFoundError,
+        SnapshotCorruptError,
+        SnapshotMismatchError,
+        WriteFailureError,
+    ) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    prune_snapshots(history_dir, default_retention_limit())
+    prune_snapshots(
+        history_dir,
+        default_retention_limit(),
+        timetable=Path(args.file),
+    )
     print(f"Restored snapshot '{result['id']}' into '{args.file}'.")
+    return 0
+
+
+def cmd_undo(args):
+    """Undo the latest recorded mutation of the active timetable."""
+    try:
+        entry = undo_last(Path(args.file))
+    except HistoryFileError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Undid {entry['operation']} on '{args.file}' "
+        f"(recorded {entry['at']})."
+    )
+    return 0
+
+
+def cmd_redo(args):
+    """Redo the latest undone mutation of the active timetable."""
+    try:
+        entry = redo_last(Path(args.file))
+    except HistoryFileError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Redid {entry['operation']} on '{args.file}' "
+        f"(recorded {entry['at']})."
+    )
+    return 0
+
+
+def cmd_undo_history(args):
+    """List recorded undo entries (operation type and timestamp only)."""
+    try:
+        journal = load_journal(Path(args.file))
+    except HistoryFileError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    entries = journal["undo"]
+    if not entries:
+        print("No recorded changes.")
+        return 0
+    for entry in reversed(entries):
+        print(f"{entry['id']}  {entry['at']}  {entry['operation']}")
     return 0
 
 
@@ -318,15 +429,21 @@ def cmd_add(args):
     })
     data[day].sort(key=lambda s: s.get("start", ""))
 
-    # Snapshot the timetable as it was *before* this addition (so restoring
-    # undoes it), then write atomically.  Validation above already succeeded,
-    # so the write is genuinely attempted here.
-    _write_timetable_with_snapshot(
-        data,
+    # Snapshot the timetable as it was *before* this addition (kept for the
+    # existing `history` browser), then record the mutation transactionally:
+    # the shared helper validates the proposed state, writes the undo journal
+    # first, then atomically replaces the timetable.  Validation above already
+    # succeeded, so the write is genuinely attempted here.
+    _save_snapshot_before_file_write(
+        previous_state,
         filepath=Path(args.file),
         operation="add",
-        previous=previous_state,
     )
+    try:
+        commit_mutation(Path(args.file), "add", data)
+    except (HistoryFileError, NoOpError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     print(f"Successfully added '{args.subject}' to {day.capitalize()}.")
 
 
@@ -415,11 +532,10 @@ def cmd_import_csv(args):
 
     updated = apply_import(timetable_data, plan)
     try:
-        save_timetable_atomic(updated, args.file)
-    except OSError as exc:
-        print(f"Error: Could not write timetable '{args.file}': {exc}", file=sys.stderr)
+        commit_mutation(Path(args.file), "import-csv", updated)
+    except (HistoryFileError, NoOpError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
-
     print(render_plan(plan))
     print(f"Successfully imported {len(plan.new_classes)} class(es) into '{args.file}'.")
     sys.exit(0)
@@ -546,25 +662,25 @@ def cmd_merge(args):
         sys.exit(1)
 
     if output_path:
-        previous_state = None
         output_file = Path(output_path)
+        # Keep the existing `history` snapshot when the output file already
+        # holds readable content (matches the previous behavior).
         if output_file.exists():
             try:
                 previous_state = load_timetable(output_file)
             except (OSError, ValueError):
                 previous_state = None
-
-        if previous_state is None:
-            # Nothing meaningful to preserve (new or unreadable output file);
-            # just write the merged data atomically.
-            _atomic_save_timetable(merged_data, output_file)
-        else:
-            _write_timetable_with_snapshot(
-                merged_data,
-                filepath=output_file,
-                operation="merge",
-                previous=previous_state,
-            )
+            if previous_state is not None:
+                _save_snapshot_before_file_write(
+                    previous_state,
+                    filepath=output_file,
+                    operation="merge",
+                )
+        try:
+            commit_mutation(output_file, "merge", merged_data)
+        except (HistoryFileError, NoOpError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"Successfully merged timetables into '{args.output}'.")
     else:
         print("Successfully merged timetables (dry run, no --output specified).")
@@ -604,6 +720,22 @@ def main():
     p_filter.add_argument("--end", help="Range end time (HH:MM)")
     p_filter.add_argument("--room", help="Room/location to match exactly")
     p_filter.set_defaults(func=cmd_filter)
+
+    # free
+    p_free = subparsers.add_parser(
+        "free",
+        help="Find free intervals that fit a requested duration",
+    )
+    p_free.add_argument(
+        "--duration",
+        type=int,
+        required=True,
+        help="Minimum length of a free interval to report, in minutes (positive integer)",
+    )
+    p_free.add_argument("--day", help="Restrict the search to one weekday (e.g. monday, tuesday)")
+    p_free.add_argument("--start", help="Working window start time (HH:MM)")
+    p_free.add_argument("--end", help="Working window end time (HH:MM)")
+    p_free.set_defaults(func=cmd_free)
 
     # export
     p_export = subparsers.add_parser("export", help="Export the timetable as an .ics calendar file")
@@ -751,6 +883,27 @@ def main():
         "(defaults to .timetable-history next to the timetable).",
     )
     p_restore.set_defaults(func=cmd_restore)
+
+    # undo
+    p_undo = subparsers.add_parser(
+        "undo",
+        help="Undo the latest recorded change to the timetable",
+    )
+    p_undo.set_defaults(func=cmd_undo)
+
+    # redo
+    p_redo = subparsers.add_parser(
+        "redo",
+        help="Redo the latest undone change to the timetable",
+    )
+    p_redo.set_defaults(func=cmd_redo)
+
+    # undo-history
+    p_undo_history = subparsers.add_parser(
+        "undo-history",
+        help="List recorded undo entries for the timetable",
+    )
+    p_undo_history.set_defaults(func=cmd_undo_history)
 
     args = parser.parse_args()
     if not args.command:
