@@ -304,7 +304,15 @@ def _validate_timetable_structure(data: Any, snapshot_id: str) -> None:
         raise SnapshotCorruptError(
             "Snapshot '%s' timetable root is not an object." % (snapshot_id,)
         )
-    for day, slots in data.items():
+    target = data
+    if "schema_version" in data:
+        if "timetable" not in data or not isinstance(data["timetable"], dict):
+            raise SnapshotCorruptError(
+                "Snapshot '%s' versioned timetable is missing 'timetable' object." % (snapshot_id,)
+            )
+        target = data["timetable"]
+
+    for day, slots in target.items():
         if not isinstance(day, str):
             raise SnapshotCorruptError(
                 "Snapshot '%s' has a non-string weekday key." % (snapshot_id,)

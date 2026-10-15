@@ -116,7 +116,17 @@ def validate_timetable(data, path="timetable"):
             f"weekdays to a list of classes"
         )
 
-    for day, slots in data.items():
+    target = data
+    if "schema_version" in data:
+        if "timetable" in data and isinstance(data["timetable"], dict):
+            target = data["timetable"]
+        else:
+            # Flat versioned document: exclude schema_version and metadata
+            target = {k: v for k, v in data.items() if k not in ("schema_version", "metadata")}
+    elif "metadata" in data:
+        target = {k: v for k, v in data.items() if k != "metadata"}
+
+    for day, slots in target.items():
         if not isinstance(day, str):
             raise DiffError(
                 f"Invalid timetable in {path}: weekday names must be strings"
@@ -131,7 +141,7 @@ def validate_timetable(data, path="timetable"):
                     f"Invalid timetable in {path}: entry {position} on "
                     f"{day} must be a class object"
                 )
-    return data
+    return target
 
 
 def load_for_diff(path):

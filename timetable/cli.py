@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
+from timetable.schema import SchemaError
 from timetable.display import render_day, render_week, WEEKDAYS
 from timetable.filter import filter_timetable, render_filter
 from timetable.free import find_free_slots, render_free_slots
@@ -233,30 +234,8 @@ def _save_snapshot_before_file_write(
 
 
 def _atomic_save_timetable(data: Dict[str, Any], filepath: Path) -> None:
-    """Write *data* to *filepath* atomically (write-to-temp then replace).
-
-    :func:`timetable.loader.save_timetable` truncates the destination before
-    writing, so a mid-write failure would leave a corrupted timetable.  This
-    helper writes a temporary file next to the target and renames it over the
-    target only after the JSON has been fully written and flushed.
-    """
-    path = Path(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name, suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    """Write *data* to *filepath* atomically using :func:`timetable.loader.save_timetable`."""
+    save_timetable(data, filepath)
 
 
 def _write_timetable_with_snapshot(
@@ -684,7 +663,7 @@ def cmd_merge(args):
         if output_file.exists():
             try:
                 previous_state = load_timetable(output_file)
-            except (OSError, ValueError):
+            except (OSError, ValueError, SchemaError):
                 previous_state = None
             if previous_state is not None:
                 _save_snapshot_before_file_write(
@@ -1151,7 +1130,12 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    result = args.func(args)
+    try:
+        result = args.func(args)
+    except SchemaError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     if isinstance(result, int) and result != 0:
         sys.exit(result)
 

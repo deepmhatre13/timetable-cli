@@ -303,6 +303,7 @@ Read-only commands (`show`, `week`, `now`, `filter`, `diff`, `conflicts`, `stats
 - **Untrusted Input Validation**: Journals are treated as untrusted input. Schemas, versions, timetable paths, JSON snapshots, and SHA-256 checksums are verified prior to loading. Corrupt or malformed journals are rejected with an error and are never silently overwritten or reset.
 - **Explicit Reset**: To reset a corrupted journal without touching the timetable, run python to invoke `timetable.undo.recreate_journal(filepath)`.
 
+
 ## Timetable Optimization
  
 ```bash
@@ -365,9 +366,48 @@ An optional JSON configuration file can define weights, fixed subjects, allowed 
 - **Stale result rejection**: If the timetable file was modified concurrently while the optimizer was running, the proposal is safely aborted without overwriting.
 - **Atomic persistence and history**: Applied optimizations are written atomically and recorded as an `optimize` snapshot in `.timetable-history/`.
 
+## Timetable Schema & Migrations
+
+`timetable-cli` uses a versioned JSON schema (current version: `1`) with strict schema validation and an automated migration framework.
+
+### Schema Version 1
+
+Canonical versioned timetable documents specify `schema_version: 1` and map weekdays to class entries:
+
+```json
+{
+  "schema_version": 1,
+  "monday": [
+    {
+      "subject": "Mathematics",
+      "start": "09:00",
+      "end": "10:30",
+      "room": "Room 101"
+    }
+  ],
+  "tuesday": [],
+  "wednesday": [],
+  "thursday": [],
+  "friday": [],
+  "saturday": [],
+  "sunday": [],
+  "metadata": {}
+}
+```
+
+Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}` representations are supported.
+
+### Backward Compatibility & Migration-on-Write Policy
+
+- **Read operations** (`show`, `week`, `now`, `export`, `filter`, `diff`, `stats`, `conflicts`): Transparently normalize legacy unversioned files in-memory without rewriting them to disk.
+- **Mutating operations** (`add`, `merge`, `restore`): Safely migrate valid legacy files to version 1 upon saving using atomic file writes.
+- **Safety**: Malformed data or future unsupported schema versions (e.g. `schema_version: 99`) are rejected with clear, actionable validation error paths (`Invalid timetable at <path>: <message>`) and never overwritten or silently coerced.
+
+
 ## Code
 
-- `timetable/loader.py`: reading and writing `timetable.json`
+- `timetable/schema.py`: canonical schema definitions, strict validation, and migration framework
+- `timetable/loader.py`: reading and writing `timetable.json` safely and atomically
 - `timetable/display.py`: printing a day or the week, plus time parsing
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file
