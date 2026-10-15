@@ -178,9 +178,47 @@ python3 -m timetable restore snap-20260101120000000000-000000
 - **Snapshot layout**: each snapshot is a directory `<id>/` containing `timetable.json` and `.metadata.json`. The metadata records the id, creation time, source timetable path, operation, and a SHA-256 checksum of the timetable bytes; `list`/`show`/`restore` verify the checksum before trusting the data.
 - **Retention**: the newest `TIMETABLE_HISTORY_LIMIT` snapshots are kept (default `10`). Set the environment variable to a positive integer to change it, e.g. `$env:TIMETABLE_HISTORY_LIMIT = "20"` (PowerShell) or `TIMETABLE_HISTORY_LIMIT=20 python3 -m timetable history list` (bash). Older snapshots are pruned after each save and restore; `restore-previous` snapshots are protected from pruning so the pre-restore state stays recoverable.
 
+## Timetable Schema & Migrations
+
+`timetable-cli` uses a versioned JSON schema (current version: `1`) with strict schema validation and an automated migration framework.
+
+### Schema Version 1
+
+Canonical versioned timetable documents specify `schema_version: 1` and map weekdays to class entries:
+
+```json
+{
+  "schema_version": 1,
+  "monday": [
+    {
+      "subject": "Mathematics",
+      "start": "09:00",
+      "end": "10:30",
+      "room": "Room 101"
+    }
+  ],
+  "tuesday": [],
+  "wednesday": [],
+  "thursday": [],
+  "friday": [],
+  "saturday": [],
+  "sunday": [],
+  "metadata": {}
+}
+```
+
+Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}` representations are supported.
+
+### Backward Compatibility & Migration-on-Write Policy
+
+- **Read operations** (`show`, `week`, `now`, `export`, `filter`, `diff`, `stats`, `conflicts`): Transparently normalize legacy unversioned files in-memory without rewriting them to disk.
+- **Mutating operations** (`add`, `merge`, `restore`): Safely migrate valid legacy files to version 1 upon saving using atomic file writes.
+- **Safety**: Malformed data or future unsupported schema versions (e.g. `schema_version: 99`) are rejected with clear, actionable validation error paths (`Invalid timetable at <path>: <message>`) and never overwritten or silently coerced.
+
 ## Code
 
-- `timetable/loader.py`: reading and writing `timetable.json`
+- `timetable/schema.py`: canonical schema definitions, strict validation, and migration framework
+- `timetable/loader.py`: reading and writing `timetable.json` safely and atomically
 - `timetable/display.py`: printing a day or the week, plus time parsing
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file
@@ -189,7 +227,7 @@ python3 -m timetable restore snap-20260101120000000000-000000
 - `timetable/merge.py`: combining timetables with deduplication and conflict detection
 - `timetable/import_csv.py`: parsing, validating, planning and safely writing CSV imports
 - `timetable/cli.py`: the commands
-- `tests/`: tests, run with `python3 -m unittest discover tests`
+- `tests/`: tests, run with `python3 -m unittest discover tests` or `pytest`
 
 
 ## Contributing

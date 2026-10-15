@@ -215,7 +215,15 @@ def _validate_timetable(data, source):
             f"invalid timetable in '{source}': expected a JSON object mapping weekdays to lists of classes"
         ]
 
-    for day, slots in data.items():
+    target = data
+    if "schema_version" in data:
+        if "timetable" not in data or not isinstance(data["timetable"], dict):
+            return [
+                f"invalid timetable in '{source}': expected 'timetable' object in versioned timetable"
+            ]
+        target = data["timetable"]
+
+    for day, slots in target.items():
         if not isinstance(day, str):
             errors.append(f"invalid timetable in '{source}': weekday keys must be strings")
         elif not isinstance(slots, list):
@@ -246,11 +254,14 @@ def load_timetable_for_import(path):
             data = json.load(handle)
     except json.JSONDecodeError as exc:
         raise ImportError_(f"invalid JSON in '{file_path}': {exc}") from exc
+    except OSError as exc:
         raise ImportError_(f"could not read '{file_path}': {exc}") from exc
 
     errors = _validate_timetable(data, str(file_path))
     if errors:
         raise ImportError_(errors[0])
+    if isinstance(data, dict) and "schema_version" in data and "timetable" in data:
+        return data["timetable"]
     return data
 
 

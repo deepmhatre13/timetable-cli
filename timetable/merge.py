@@ -25,7 +25,15 @@ def validate_timetable_structure(data, source_name="timetable"):
             f"Invalid timetable in '{source_name}': expected a JSON object mapping weekdays to lists of classes."
         )
 
-    for day, slots in data.items():
+    target = data
+    if "schema_version" in data:
+        if "timetable" not in data or not isinstance(data["timetable"], dict):
+            raise MergeError(
+                f"Invalid timetable in '{source_name}': expected 'timetable' object in versioned timetable."
+            )
+        target = data["timetable"]
+
+    for day, slots in target.items():
         if not isinstance(day, str):
             raise MergeError(
                 f"Invalid timetable in '{source_name}': weekday keys must be strings."
@@ -59,6 +67,8 @@ def load_timetable_for_merge(path):
         raise MergeError(f"Could not read '{file_path}': {exc}")
 
     validate_timetable_structure(data, source_name=str(file_path))
+    if isinstance(data, dict) and "schema_version" in data and "timetable" in data:
+        return data["timetable"]
     return data
 
 
