@@ -277,8 +277,15 @@ Three-way merge reconciles concurrent edits made to a common base timetable acro
 - **Diagnostics & Failure Behavior**:
   - When merge conflicts or schedule conflicts occur, structured diagnostics describing affected entries, competing values, or overlapping slots are printed to `stderr`, and the process halts with exit code `1`.
   - The destination file is **never written or partially overwritten** if any conflict occurs.
-  - Optimistic revision checks ensure that if the destination was modified concurrently, stale results are rejected.
   - Neither `base`, `ours`, nor `theirs` input files are ever modified.
+
+### Concurrency Safety: Multi-File Locking and Stale-Source Prevention
+
+To prevent stale-source merges when multiple files are involved in two-way or three-way merges:
+- **Snapshot Capture**: Revisions (SHA-256 fingerprints) of all source inputs (including `base`, `ours`, `theirs` / `first`, `second`) and the destination file (or expected absence) are captured upon initial load.
+- **Deterministic Multi-File Locking**: At the commit boundary, `MultiFileLock` acquires cross-process file locks for all source inputs and destination file simultaneously in a deterministic, globally consistent canonical path order (`os.path.normcase`). This eliminates lock-order deadlocks regardless of the order arguments were passed.
+- **Deduplication & Failure Rollback**: Duplicate or equivalent file paths are deduplicated so files are not locked multiple times. If any lock cannot be acquired within the timeout, all previously acquired locks are immediately released before propagating the error.
+- **Revalidation Under Lock**: Under the multi-file lock, all source revisions and destination revision are re-validated before writing. If any source file was modified concurrently or destination state diverged, the merge aborts with exit code `1` (`ConcurrentModificationError`) without writing or corrupting the destination.
 
 ## Version history and restore
 
@@ -453,6 +460,8 @@ Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}`
 - Every mutation path (`add`, `import-csv`, `import-ics`, `merge`, `restore`, `undo`, `redo`) acquires a cross-process file lock on the target timetable before writing.
 - **Lock mechanism**: Built on OS-level primitives (`msvcrt` on Windows, `fcntl` on POSIX) via a canonical lock path (e.g. `<target>.lock`), normalized by absolute path and filesystem casing.
 - **Lock persistence**: Lock files are retained on release rather than unlinked, eliminating file-descriptor and inode reuse race conditions. Runtime lock files (`*.lock`) are coordination files and should not be edited or deleted during operation.
+- **Deterministic Multi-File Locking**: Multi-resource operations (`merge`) use `MultiFileLock` to coordinate locks across all input files and destination files in a globally deterministic canonical path order (`os.path.normcase`), preventing deadlocks across concurrent runs.
+- **Rollback on lock failure**: If any lock acquisition in a multi-file sequence times out or fails, all already-acquired locks are immediately released in reverse order before propagating the error.
 - **Configurable timeout**: Acquisition timeout defaults to 10.0 seconds and can be configured with the `TIMETABLE_LOCK_TIMEOUT` environment variable. If another process holds the lock beyond this threshold, the command aborts cleanly with exit code `1` and an informative timeout message.
 
 ### Cryptographic Revision Tokens

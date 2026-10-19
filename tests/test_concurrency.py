@@ -493,3 +493,204 @@ class TestCliConcurrencyProtection:
                 expected_revision=initial_snap.revision,
             )
         assert "modified by another process concurrently" in str(exc_info.value)
+
+
+class TestMultiFileLock:
+    """Tests for MultiFileLock deterministic ordering, deduplication, and failure rollback."""
+
+    def test_multi_file_lock_deduplication_and_deterministic_order(self, temp_dir):
+        from timetable.locking import MultiFileLock
+        f1 = temp_dir / "b_tt.json"
+        f2 = temp_dir / "a_tt.json"
+        f1_alias = temp_dir / "." / "b_tt.json"
+
+        # Pass paths in reverse order with duplicate
+        m_lock = MultiFileLock([f1, f2, f1_alias])
+        assert len(m_lock.locks) == 2
+        # Deterministically sorted by os.path.normcase(canonical_lock_path)
+        lock_paths = [str(l.lock_path) for l in m_lock.locks]
+        assert lock_paths == sorted(lock_paths, key=os.path.normcase)
+
+        with m_lock:
+            assert len(m_lock.acquired_locks) == 2
+
+        assert len(m_lock.acquired_locks) == 0
+
+    def test_multi_file_lock_rollback_on_failure(self, temp_dir):
+        from timetable.locking import MultiFileLock
+        f1 = temp_dir / "first.json"
+        f2 = temp_dir / "second.json"
+
+        # Construct MultiFileLock
+        m_lock = MultiFileLock([f1, f2], timeout=0.3)
+        assert len(m_lock.locks) == 2
+
+        # Mock the second lock's acquire to raise LockTimeoutError
+        target_lock_to_fail = m_lock.locks[1]
+        with patch.object(
+            target_lock_to_fail,
+            "acquire",
+            side_effect=LockTimeoutError(target_lock_to_fail.target_path, 0.3),
+        ):
+            with pytest.raises(LockTimeoutError):
+                with m_lock:
+                    pass
+
+        # Since second lock failed, first lock must have been rolled back and released
+        assert len(m_lock.acquired_locks) == 0
+
+        # Verify f1 can be locked immediately
+        f1_lock = TimetableFileLock(f1, timeout=0.1)
+        with f1_lock:
+            pass
+
+    def test_multi_file_lock_deadlock_prevention(self, temp_dir):
+        """Two concurrent threads requesting conflicting order acquire safely without deadlocking."""
+        from timetable.locking import MultiFileLock
+        import threading
+
+        f1 = temp_dir / "resource_1.json"
+        f2 = temp_dir / "resource_2.json"
+        f1.write_text("{}", encoding="utf-8")
+        f2.write_text("{}", encoding="utf-8")
+
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker(paths, worker_id):
+            barrier.wait()
+            try:
+                with MultiFileLock(paths, timeout=5.0):
+                    time.sleep(0.05)
+                    results.append(worker_id)
+            except Exception as exc:
+                results.append(f"err: {exc}")
+
+        # Thread 1 requests [f1, f2], Thread 2 requests [f2, f1]
+        t1 = threading.Thread(target=worker, args=([f1, f2], "T1"))
+        t2 = threading.Thread(target=worker, args=([f2, f1], "T2"))
+
+        t1.start()
+        t2.start()
+        t1.join(timeout=10.0)
+        t2.join(timeout=10.0)
+
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+        assert set(results) == {"T1", "T2"}
+
+
+class TestMergeStaleSourceLocking:
+    """Tests that CLI merge detects stale sources and base under multi-file locking."""
+
+    def run_cli(self, *args: str) -> tuple[int, str, str]:
+        stdout_buf = StringIO()
+        stderr_buf = StringIO()
+        real_argv = sys.argv
+        sys.argv = ["timetable", *args]
+        code = 0
+        try:
+            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
+                try:
+                    main()
+                except SystemExit as exc:
+                    code = exc.code if exc.code is not None else 0
+        finally:
+            sys.argv = real_argv
+        return code, stdout_buf.getvalue(), stderr_buf.getvalue()
+
+    def test_merge_two_way_stale_source_rejected(self, temp_dir):
+        f1 = temp_dir / "tt1.json"
+        f2 = temp_dir / "tt2.json"
+        out_f = temp_dir / "out.json"
+
+        f1.write_text(json.dumps(_sample_timetable(), indent=2), encoding="utf-8")
+        f2.write_text(json.dumps(_sample_timetable(), indent=2), encoding="utf-8")
+
+        # Simulate f1 being modified between load and lock commit
+        orig_load = load_timetable_snapshot
+
+        def raced_load(filepath, **kwargs):
+            snap = orig_load(filepath, **kwargs)
+            # Mutate f1 right after initial load
+            if Path(filepath).resolve() == f1.resolve():
+                f1.write_text('{"modified": "stale_f1"}', encoding="utf-8")
+            return snap
+
+        with patch("timetable.cli.load_timetable_snapshot", side_effect=raced_load):
+            code, out, err = self.run_cli(
+                "merge",
+                str(f1),
+                str(f2),
+                "--output",
+                str(out_f),
+            )
+
+        assert code == 1
+        assert "modified by another process concurrently" in err
+        assert not out_f.exists()
+
+    def test_merge_three_way_stale_base_rejected(self, temp_dir):
+        base = temp_dir / "base.json"
+        ours = temp_dir / "ours.json"
+        theirs = temp_dir / "theirs.json"
+        out_f = temp_dir / "out.json"
+
+        base.write_text(json.dumps(_sample_timetable(), indent=2), encoding="utf-8")
+        ours.write_text(json.dumps(_sample_timetable(), indent=2), encoding="utf-8")
+        theirs.write_text(json.dumps(_sample_timetable(), indent=2), encoding="utf-8")
+
+        orig_load = load_timetable_snapshot
+
+        def raced_load(filepath, **kwargs):
+            snap = orig_load(filepath, **kwargs)
+            # Mutate base right after initial snapshot load
+            if Path(filepath).resolve() == base.resolve():
+                base.write_text('{"modified": "stale_base"}', encoding="utf-8")
+            return snap
+
+        with patch("timetable.cli.load_timetable_snapshot", side_effect=raced_load):
+            code, out, err = self.run_cli(
+                "merge",
+                str(base),
+                str(ours),
+                str(theirs),
+                "--output",
+                str(out_f),
+            )
+
+        assert code == 1
+        assert "modified by another process concurrently" in err
+        assert not out_f.exists()
+
+    def test_merge_destination_concurrently_created_rejected(self, temp_dir):
+        f1 = temp_dir / "tt1.json"
+        f2 = temp_dir / "tt2.json"
+        out_f = temp_dir / "out_absent.json"
+
+        f1.write_text(json.dumps(_sample_timetable(), indent=2), encoding="utf-8")
+        f2.write_text(json.dumps(_sample_timetable(), indent=2), encoding="utf-8")
+
+        # Out file is initially absent
+        assert not out_f.exists()
+
+        orig_load = load_timetable_snapshot
+
+        def raced_load(filepath, **kwargs):
+            snap = orig_load(filepath, **kwargs)
+            # Concurrently create out_f when loading f2
+            if Path(filepath).resolve() == f2.resolve():
+                out_f.write_text('{"unexpected": "created"}', encoding="utf-8")
+            return snap
+
+        with patch("timetable.cli.load_timetable_snapshot", side_effect=raced_load):
+            code, out, err = self.run_cli(
+                "merge",
+                str(f1),
+                str(f2),
+                "--output",
+                str(out_f),
+            )
+
+        assert code == 1
+        assert "created by another process concurrently" in err

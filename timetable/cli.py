@@ -84,7 +84,13 @@ from timetable.undo import (
     redo_last,
     undo_last,
 )
-from timetable.locking import ConcurrentModificationError, LockTimeoutError, TimetableFileLock
+from timetable.locking import (
+    ConcurrencyError,
+    ConcurrentModificationError,
+    LockTimeoutError,
+    MultiFileLock,
+    TimetableFileLock,
+)
 from timetable.revision import REVISION_ABSENT, load_timetable_snapshot
 
 
@@ -709,27 +715,34 @@ def cmd_merge(args):
                 file=sys.stderr,
             )
             sys.exit(1)
+    # If destination specified, capture its initial revision before loading sources
+    output_file = Path(output_path) if output_path else None
+    expected_dest_snap = load_timetable_snapshot(output_file, validate=False) if output_file else None
 
-    # If destination exists, snapshot initial bytes for optimistic concurrency / stale check
-    raw_initial_bytes = None
-    if output_path and output_path.exists():
-        try:
-            raw_initial_bytes = output_path.read_bytes()
-        except OSError as exc:
-            print(f"Error: Could not read '{output_path}': {exc}", file=sys.stderr)
-            sys.exit(1)
-
+    # Validate input files exist and are valid timetables, capturing source revisions
+    source_snapshots = {}
     try:
-        if is_three_way:
-            base_data = load_timetable_for_merge(base_file)
-            ours_data = load_timetable_for_merge(ours_file)
-            theirs_data = load_timetable_for_merge(theirs_file)
-        else:
-            first_data = load_timetable_for_merge(first_file)
-            second_data = load_timetable_for_merge(second_file)
+        for role, p in input_paths.items():
+            # load_timetable_for_merge raises MergeError for missing files, invalid JSON, or schema errors
+            load_timetable_for_merge(p)
+            source_snapshots[p] = load_timetable_snapshot(p, validate=True)
     except MergeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+    except (ValueError, SchemaError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"Error reading input: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if is_three_way:
+        base_data = source_snapshots[input_paths["base"]].data
+        ours_data = source_snapshots[input_paths["ours"]].data
+        theirs_data = source_snapshots[input_paths["theirs"]].data
+    else:
+        first_data = source_snapshots[input_paths["first"]].data
+        second_data = source_snapshots[input_paths["second"]].data
 
     if is_three_way:
         result = merge_three_way(base_data, ours_data, theirs_data)
@@ -746,45 +759,60 @@ def cmd_merge(args):
             sys.exit(1)
 
     if output_path:
-        output_file = Path(output_path)
-        output_snap = load_timetable_snapshot(output_file, validate=False)
-        if output_file.exists():
-            try:
-                previous_state = load_timetable(output_file)
-            except (OSError, ValueError, SchemaError):
-                previous_state = None
-            if previous_state is not None:
-                _save_snapshot_before_file_write(
-                    previous_state,
-                    filepath=output_file,
-                    operation="merge",
-                )
-
-        # Re-check stale destination before write
-        if output_file.exists() and raw_initial_bytes is not None:
-            try:
-                current_bytes = output_file.read_bytes()
-                if current_bytes != raw_initial_bytes:
-                    print(
-                        f"Error: Destination file '{output_file}' was modified concurrently. "
-                        "Rejecting stale merge result.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-            except OSError as exc:
-                print(f"Error: Could not verify destination '{output_file}': {exc}", file=sys.stderr)
-                sys.exit(1)
+        # Collect all files to lock in deterministic order: all sources + destination
+        all_lock_paths = list(input_paths.values()) + [output_file]
 
         try:
-            commit_mutation(
-                output_file,
-                "merge",
-                merged_data,
-                expected_revision=output_snap.revision,
-            )
-        except (HistoryFileError, NoOpError) as exc:
-            # If NoOpError, save_timetable directly to ensure output file is present
-            save_timetable(merged_data, output_file)
+            with MultiFileLock(all_lock_paths):
+                # 1. Revalidate all source revisions under the lock
+                for p, initial_snap in source_snapshots.items():
+                    current_snap = load_timetable_snapshot(p, validate=False)
+                    if current_snap.revision != initial_snap.revision:
+                        raise ConcurrentModificationError(
+                            p,
+                            expected_revision=initial_snap.revision,
+                            current_revision=current_snap.revision,
+                        )
+
+                # 2. Revalidate destination revision under the lock
+                dest_current_snap = load_timetable_snapshot(output_file, validate=False)
+                if dest_current_snap.revision != expected_dest_snap.revision:
+                    raise ConcurrentModificationError(
+                        output_file,
+                        expected_revision=expected_dest_snap.revision,
+                        current_revision=dest_current_snap.revision,
+                    )
+
+                # 3. Snapshot destination for history if it exists
+                if output_file.exists():
+                    try:
+                        previous_state = load_timetable(output_file)
+                    except (OSError, ValueError, SchemaError):
+                        previous_state = None
+                    if previous_state is not None:
+                        _save_snapshot_before_file_write(
+                            previous_state,
+                            filepath=output_file,
+                            operation="merge",
+                        )
+
+                # 4. Commit mutation to destination
+                # Note: TimetableFileLock is reentrant across thread calls so commit_mutation
+                # will re-acquire destination lock safely.
+                try:
+                    commit_mutation(
+                        output_file,
+                        "merge",
+                        merged_data,
+                        expected_revision=expected_dest_snap.revision,
+                    )
+                except (HistoryFileError, NoOpError) as exc:
+                    # If NoOpError, save_timetable directly to ensure output file is present
+                    save_timetable(merged_data, output_file)
+        except ConcurrencyError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
         print(f"Successfully merged timetables into '{args.output}'.")
     else:
         print("Successfully merged timetables (dry run, no --output specified).")
