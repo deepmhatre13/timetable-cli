@@ -42,8 +42,10 @@ from timetable.history import (
 from timetable.merge import (
     MergeError,
     load_timetable_for_merge,
+    merge_three_way,
     merge_timetables,
     render_merge_conflicts,
+    render_three_way_conflicts,
     validate_timetable_structure,
 )
 from timetable.import_csv import (
@@ -618,10 +620,45 @@ def cmd_import_ics(args):
 
 
 def cmd_merge(args):
-    """Merges two timetable JSON files with conflict detection."""
+    """Merges two or three timetable JSON files with conflict detection."""
+    # Determine base, ours, theirs or first, second
+    files = list(args.files) if hasattr(args, "files") and args.files else []
+    if not files:
+        if getattr(args, "first", None) and getattr(args, "second", None):
+            files = [args.first, args.second]
+
+    base_arg = getattr(args, "base", None)
+    is_three_way = False
+
+    if base_arg:
+        is_three_way = True
+        base_file = base_arg
+        if len(files) != 2:
+            print("Error: When --base is provided, exactly two modified timetable files ('ours' and 'theirs') must be specified.", file=sys.stderr)
+            sys.exit(1)
+        ours_file, theirs_file = files[0], files[1]
+    elif len(files) == 3:
+        is_three_way = True
+        base_file, ours_file, theirs_file = files[0], files[1], files[2]
+    elif len(files) == 2:
+        is_three_way = False
+        first_file, second_file = files[0], files[1]
+    else:
+        print("Error: 'merge' requires either two files (two-way merge) or three files (base, ours, theirs for three-way merge).", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        first_path = Path(args.first).resolve()
-        second_path = Path(args.second).resolve()
+        if is_three_way:
+            input_paths = {
+                "base": Path(base_file).resolve(),
+                "ours": Path(ours_file).resolve(),
+                "theirs": Path(theirs_file).resolve(),
+            }
+        else:
+            input_paths = {
+                "first": Path(first_file).resolve(),
+                "second": Path(second_file).resolve(),
+            }
     except Exception as exc:
         print(f"Error resolving paths: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -629,12 +666,13 @@ def cmd_merge(args):
     output_path = Path(args.output).resolve() if args.output else None
 
     if output_path:
-        if output_path == first_path or output_path == second_path:
-            print(
-                f"Error: Output file '{args.output}' cannot be the same as input file '{args.first if output_path == first_path else args.second}'.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        for role, p in input_paths.items():
+            if output_path == p:
+                print(
+                    f"Error: Output file '{args.output}' cannot be the same as input file '{p}'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         if output_path.exists() and not args.force:
             print(
                 f"Error: Output file '{args.output}' already exists. Use --force to overwrite.",
@@ -642,24 +680,44 @@ def cmd_merge(args):
             )
             sys.exit(1)
 
+    # If destination exists, snapshot initial bytes for optimistic concurrency / stale check
+    raw_initial_bytes = None
+    if output_path and output_path.exists():
+        try:
+            raw_initial_bytes = output_path.read_bytes()
+        except OSError as exc:
+            print(f"Error: Could not read '{output_path}': {exc}", file=sys.stderr)
+            sys.exit(1)
+
     try:
-        first_data = load_timetable_for_merge(args.first)
-        second_data = load_timetable_for_merge(args.second)
+        if is_three_way:
+            base_data = load_timetable_for_merge(base_file)
+            ours_data = load_timetable_for_merge(ours_file)
+            theirs_data = load_timetable_for_merge(theirs_file)
+        else:
+            first_data = load_timetable_for_merge(first_file)
+            second_data = load_timetable_for_merge(second_file)
     except MergeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    merged_data, conflicts = merge_timetables(first_data, second_data)
-
-    if conflicts:
-        print(render_merge_conflicts(conflicts), file=sys.stderr)
-        print("Error: Could not merge timetables due to scheduling conflicts.", file=sys.stderr)
-        sys.exit(1)
+    if is_three_way:
+        result = merge_three_way(base_data, ours_data, theirs_data)
+        if result.has_conflicts:
+            print(render_three_way_conflicts(result), file=sys.stderr)
+            print("Error: Could not merge timetables due to conflicts.", file=sys.stderr)
+            sys.exit(1)
+        merged_data = result.merged_data
+    else:
+        merged_data, conflicts = merge_timetables(first_data, second_data)
+        if conflicts:
+            print(render_merge_conflicts(conflicts), file=sys.stderr)
+            print("Error: Could not merge timetables due to scheduling conflicts.", file=sys.stderr)
+            sys.exit(1)
 
     if output_path:
         output_file = Path(output_path)
-        # Keep the existing `history` snapshot when the output file already
-        # holds readable content (matches the previous behavior).
+        # Check optimistic revision / stale destination protection
         if output_file.exists():
             try:
                 previous_state = load_timetable(output_file)
@@ -671,11 +729,27 @@ def cmd_merge(args):
                     filepath=output_file,
                     operation="merge",
                 )
+
+        # Re-check stale destination before write
+        if output_file.exists() and raw_initial_bytes is not None:
+            try:
+                current_bytes = output_file.read_bytes()
+                if current_bytes != raw_initial_bytes:
+                    print(
+                        f"Error: Destination file '{output_file}' was modified concurrently. "
+                        "Rejecting stale merge result.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            except OSError as exc:
+                print(f"Error: Could not verify destination '{output_file}': {exc}", file=sys.stderr)
+                sys.exit(1)
+
         try:
             commit_mutation(output_file, "merge", merged_data)
         except (HistoryFileError, NoOpError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
+            # If NoOpError, save_timetable directly to ensure output file is present
+            save_timetable(merged_data, output_file)
         print(f"Successfully merged timetables into '{args.output}'.")
     else:
         print("Successfully merged timetables (dry run, no --output specified).")
@@ -980,10 +1054,17 @@ def main():
     # merge
     p_merge = subparsers.add_parser(
         "merge",
-        help="Merge two timetable JSON files with conflict detection",
+        help="Merge two or three timetable JSON files with conflict detection",
     )
-    p_merge.add_argument("first", help="Path to first timetable JSON file")
-    p_merge.add_argument("second", help="Path to second timetable JSON file")
+    p_merge.add_argument(
+        "files",
+        nargs="+",
+        help="Timetable files to merge. Specify two files (first second) or three files (base ours theirs).",
+    )
+    p_merge.add_argument(
+        "--base",
+        help="Path to common base timetable file (optional alternative for three-way merge: --base <base> <ours> <theirs>).",
+    )
     p_merge.add_argument("--output", help="Path to output merged timetable JSON file")
     p_merge.add_argument("--force", action="store_true", help="Overwrite output file if it already exists")
     p_merge.set_defaults(func=cmd_merge)
