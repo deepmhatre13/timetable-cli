@@ -587,7 +587,11 @@ class TestThreeWayMergeCLI(MergeTestCase):
         with patch.object(timetable.cli, "load_timetable_for_merge", side_effect=mocked_load):
             code, out, err = self.run_merge(str(base), str(ours), str(theirs), "--output", str(out_p), "--force")
             self.assertEqual(code, 1)
+
             self.assertIn("was modified concurrently", err)
+
+            self.assertIn("was modified by another process concurrently", err)
+
 
     def test_cli_three_way_input_files_remain_unchanged(self):
         """Source files are never modified by three-way merge."""

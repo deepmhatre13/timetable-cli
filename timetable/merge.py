@@ -75,6 +75,7 @@ def load_timetable_for_merge(path):
         raise MergeError(f"Could not read '{file_path}': {exc}") from exc
 
 
+
 def canonicalize_slot(slot):
     """Returns a canonical dictionary representation of a class slot."""
     return {
