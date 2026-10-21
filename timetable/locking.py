@@ -5,7 +5,11 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+
 from typing import Optional, Union
+
+from typing import Optional, Sequence, Union
+
 
 import filelock
 
@@ -200,4 +204,75 @@ class TimetableFileLock:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.release()
+
+
+
+class MultiFileLock:
+    """Acquires and releases multiple TimetableFileLocks in deterministic global order.
+
+    - Resolves and canonicalizes all paths.
+    - Sorts unique canonical lock paths to prevent lock-order deadlocks.
+    - Deduplicates identical/equivalent paths so files are not locked multiple times.
+    - If any lock acquisition fails or times out, immediately releases all
+      previously acquired locks before raising the exception.
+    """
+
+    def __init__(
+        self,
+        paths: Sequence[Union[str, Path]],
+        timeout: Optional[float] = None,
+    ):
+        self.timeout = validate_timeout(timeout)
+        # Deduplicate paths by canonical lock path while preserving deterministic order
+        unique_targets: dict[Path, Path] = {}
+        for p in paths:
+            if p is None:
+                continue
+            res_p = Path(p).resolve()
+            clp = canonical_lock_path(res_p)
+            if clp not in unique_targets:
+                unique_targets[clp] = res_p
+
+        # Sort deterministically by canonical lock path string (os.path.normcase)
+        sorted_pairs = sorted(
+            unique_targets.items(),
+            key=lambda item: os.path.normcase(str(item[0])),
+        )
+        self.locks = [
+            TimetableFileLock(target, timeout=self.timeout)
+            for _, target in sorted_pairs
+        ]
+        self.acquired_locks: list[TimetableFileLock] = []
+
+    def acquire(self, timeout: Optional[float] = None) -> None:
+        """Acquire all locks in sorted order, rolling back completely on failure."""
+        actual_timeout = validate_timeout(timeout) if timeout is not None else self.timeout
+        self.acquired_locks = []
+        try:
+            for lock in self.locks:
+                lock.acquire(timeout=actual_timeout)
+                self.acquired_locks.append(lock)
+        except Exception:
+            self.release()
+            raise
+
+    def release(self) -> None:
+        """Release all acquired locks in reverse order."""
+        errors = []
+        while self.acquired_locks:
+            lock = self.acquired_locks.pop()
+            try:
+                lock.release()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def __enter__(self) -> MultiFileLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.release()
+
 
