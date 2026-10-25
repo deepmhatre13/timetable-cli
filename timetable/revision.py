@@ -10,7 +10,9 @@ from typing import Any, Dict, List, Optional, Union
 
 from timetable.display import WEEKDAYS
 from timetable.loader import DEFAULT_FILEPATH
+
 from timetable.transaction import TransactionCoordinator, get_transaction_dir
+
 from timetable.schema import (
     SchemaError,
     ValidationError,
@@ -70,9 +72,11 @@ def load_timetable_snapshot(
     - Distinguishes missing file, valid existing file, and malformed file.
     """
     path = Path(filepath)
+
     txn_dir = get_transaction_dir(path)
     if txn_dir.exists():
         TransactionCoordinator(path).recover_if_needed()
+
     if not path.exists():
         empty_doc = {day: [] for day in WEEKDAYS}
         return TimetableSnapshot(

@@ -51,6 +51,8 @@ On Windows, use `python` instead of `python3`.
 | `undo` | Undoes the most recent timetable change |
 | `redo` | Redoes the most recently undone timetable change |
 | `undo-history` | Lists recorded undo entries for the timetable |
+| `stats [file]` | Computes and displays aggregate statistics for a timetable |
+
 
 
 
@@ -522,6 +524,7 @@ Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}`
 
 - `timetable/history.py`: snapshot management and manual restore browser
 - `timetable/undo.py`: transactional undo and redo journal
+- `timetable/stats.py`: compute and render aggregate statistics for a timetable
 
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests` or `pytest`

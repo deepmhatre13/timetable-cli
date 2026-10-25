@@ -516,6 +516,7 @@ def restore_snapshot(
     timetable_file = Path(filepath) if filepath is not None else DEFAULT_FILEPATH
 
     with TimetableFileLock(timetable_file, timeout=lock_timeout):
+
         TransactionCoordinator(timetable_file, lock_timeout=lock_timeout).recover_if_needed()
         # 0. Check revision under the lock if expected_revision was specified
         if expected_revision is not None:

@@ -81,7 +81,9 @@ def save_timetable(data: Any, filepath=DEFAULT_FILEPATH) -> None:
     """
     path = Path(filepath)
     with TimetableFileLock(path):
+
         TransactionCoordinator(path).recover_if_needed()
+
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # Check destination if it exists: never overwrite an unsupported future schema version
