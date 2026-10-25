@@ -91,6 +91,7 @@ from timetable.locking import (
     MultiFileLock,
     TimetableFileLock,
 )
+from timetable.transaction import TransactionCoordinator
 from timetable.revision import REVISION_ABSENT, load_timetable_snapshot
 
 
@@ -266,6 +267,7 @@ def _write_timetable_with_snapshot(
     timetable behind.  Returns the snapshot id.
     """
     with TimetableFileLock(filepath, timeout=lock_timeout):
+        TransactionCoordinator(filepath, lock_timeout=lock_timeout).recover_if_needed()
         if expected_revision is not None:
             snap = load_timetable_snapshot(filepath, validate=False)
             if snap.revision != expected_revision:

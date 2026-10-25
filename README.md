@@ -344,13 +344,26 @@ Read-only commands (`show`, `week`, `now`, `filter`, `diff`, `conflicts`, `stats
 - Applying any new successful mutation after one or more undo operations automatically clears the redo stack.
 - Failed mutations or no-op changes (mutations that produce identical content) leave the redo stack untouched.
 
-### Consistency and Error Recovery
+### Crash-Recoverable Transactions and Error Recovery
 
-- **Atomic Writes**: Each state transition writes temporary files in the target directory, performs an `fsync`, and atomically replaces the destination (`os.replace`).
-- **Persistence Sequence**: The journal is persisted *before* replacing the timetable file. If writing the timetable fails, the journal update is automatically rolled back. If an unexpected power loss occurs between the journal write and timetable write, the journal contains an extra pre-mutation entry that can safely be undone without corrupting data.
-- **Untrusted Input Validation**: Journals are treated as untrusted input. Schemas, versions, timetable paths, JSON snapshots, and SHA-256 checksums are verified prior to loading. Corrupt or malformed journals are rejected with an error and are never silently overwritten or reset.
-- **Explicit Reset**: To reset a corrupted journal without touching the timetable, run python to invoke `timetable.undo.recreate_journal(filepath)`.
+Timetable modifications are executed with durable, crash-recoverable transactions managed by 	imetable.transaction.TransactionCoordinator. This eliminates inconsistencies between timetable data, undo/redo journals, and history snapshots in the event of abrupt process crashes, SIGKILL, or unexpected termination.
 
+#### Protocol States & Two-Phase Lifecycle
+
+Transactions progress through five explicit, monotonic states:
+1. PREPARING: A unique transaction directory (.timetable-transactions/txn-<timestamp>-<uuid>) is created. Target replacement payloads (such as 	imetable.json and .timetable-undo/*.json) are staged to disk with sync.
+2. PREPARED: Staged payloads, expected target revision SHA-256 digests, and payload checksums are durably recorded in 	ransaction.txn.json.
+3. COMMIT_DECIDED: The commit decision boundary is crossed. The journal state is atomically updated and synced. **Once in this state, recovery will *always* roll forward.** If interrupted prior to COMMIT_DECIDED, crash recovery will abort and discard staged files without altering targets.
+4. COMMITTED: All staged replacements have been applied to their final destinations.
+5. CLEANED: Staging files and the transaction journal have been safely unlinked.
+
+#### Automatic Crash Recovery
+
+- **Automatic Trigger**: Any timetable load (load_timetable, load_timetable_raw, load_timetable_snapshot), save, or mutation command automatically inspects the .timetable-transactions directory under TimetableFileLock.
+- **Durable Roll-Forward**: If an interrupted transaction is in COMMIT_DECIDED or COMMITTED, recovery validates staged checksums and applies target replacements idempotently, completing the mutation.
+- **Safe Abort & Cleanup**: If an interrupted transaction was only in PREPARING or PREPARED, recovery verifies target revisions have not diverged, aborts the uncommitted transaction, and removes staged artifacts.
+- **Conflict & Corruption Safety**: If an interrupted transaction encounters a target modified externally to an unexpected revision, recovery raises TransactionConflictError rather than blindly clobbering newer data. Malformed journals raise TransactionCorruptError for operator inspection.
+- **Operating-System Level Testing**: Tested under forced termination (os._exit), fault-injected crashes across all stage boundaries, repeated crash recovery, corrupt journals, and concurrent execution.
 
 ## Timetable Optimization
  

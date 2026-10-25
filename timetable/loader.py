@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from timetable.display import WEEKDAYS
 from timetable.locking import TimetableFileLock
+from timetable.transaction import TransactionCoordinator, get_transaction_dir
 from timetable.schema import (
     CURRENT_SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
@@ -37,6 +38,9 @@ def load_timetable_raw(filepath=DEFAULT_FILEPATH) -> Dict[str, Any]:
     UnsupportedSchemaVersionError if invalid or unreadable.
     """
     path = Path(filepath)
+    txn_dir = get_transaction_dir(path)
+    if txn_dir.exists():
+        TransactionCoordinator(path).recover_if_needed()
     if not path.exists():
         return create_empty_canonical_timetable()
 
@@ -56,6 +60,9 @@ def load_timetable(filepath=DEFAULT_FILEPATH) -> Dict[str, List[Dict[str, Any]]]
     Raises json.JSONDecodeError, ValidationError, or UnsupportedSchemaVersionError if invalid.
     """
     path = Path(filepath)
+    txn_dir = get_transaction_dir(path)
+    if txn_dir.exists():
+        TransactionCoordinator(path).recover_if_needed()
     if not path.exists():
         return {day: [] for day in WEEKDAYS}
 
@@ -74,6 +81,7 @@ def save_timetable(data: Any, filepath=DEFAULT_FILEPATH) -> None:
     """
     path = Path(filepath)
     with TimetableFileLock(path):
+        TransactionCoordinator(path).recover_if_needed()
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # Check destination if it exists: never overwrite an unsupported future schema version

@@ -42,6 +42,7 @@ from typing import Any, Dict, Optional
 from timetable.loader import DEFAULT_FILEPATH, load_timetable, save_timetable
 from timetable.locking import ConcurrentModificationError, TimetableFileLock
 from timetable.revision import REVISION_ABSENT, load_timetable_snapshot
+from timetable.transaction import TransactionCoordinator
 from timetable.schema import create_canonical_timetable, is_versioned_format
 
 
@@ -561,6 +562,7 @@ def commit_mutation(
         raise HistoryFileError("Mutation operation must be a non-empty string.")
 
     with TimetableFileLock(filepath, timeout=lock_timeout):
+        TransactionCoordinator(filepath, lock_timeout=lock_timeout).recover_if_needed()
         timetable_path = _resolved_timetable_path(filepath)
 
         # Check revision under the lock if expected_revision was specified
@@ -700,6 +702,7 @@ def undo_last(
     journal is invalid.
     """
     with TimetableFileLock(filepath, timeout=lock_timeout):
+        TransactionCoordinator(filepath, lock_timeout=lock_timeout).recover_if_needed()
         timetable_path = _resolved_timetable_path(filepath)
         journal = load_journal(filepath, limit=limit)
         if not journal["undo"]:
@@ -762,6 +765,7 @@ def redo_last(
     journal is modified.
     """
     with TimetableFileLock(filepath, timeout=lock_timeout):
+        TransactionCoordinator(filepath, lock_timeout=lock_timeout).recover_if_needed()
         timetable_path = _resolved_timetable_path(filepath)
         journal = load_journal(filepath, limit=limit)
         if not journal["redo"]:
