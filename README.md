@@ -530,6 +530,53 @@ Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}`
 - `tests/`: tests, run with `python3 -m unittest discover tests` or `pytest`
 
 
+## Property-Based Temporal Testing
+
+The repository includes a property-based test suite powered by [Hypothesis](https://hypothesis.readthedocs.io/) in `tests/test_temporal_properties.py`, supported by an independent temporal reference model (`tests/temporal_reference.py`) and reusable strategies (`tests/temporal_strategies.py`).
+
+### Temporal Invariants & Reference Model
+
+1. **Circular Weekly Timeline**:
+   - Time is mapped to an independent circular timeline of 10,080 minutes per week (7 days x 1,440 minutes).
+   - Weekdays are canonically indexed: `monday=0`, `tuesday=1`, ..., `sunday=6`.
+   - Overnight classes (e.g., `23:00`-`01:00`) occupy their starting weekday as well as the following weekday's early morning hours.
+   - Sunday overnight classes wrap around circularly into Monday morning.
+2. **Half-Open Intervals `[start, end)`**:
+   - Boundary-touching classes (e.g. `09:00`-`10:00` and `10:00`-`11:00`, or `23:00`-`00:00` on Monday and `00:00`-`01:00` on Tuesday) meet at an exact boundary point and do not overlap.
+3. **Conflict Symmetry & Order Independence**:
+   - Two classes collide if and only if their intervals overlap circularly: `overlap(A, B) == overlap(B, A)`.
+   - Permuting or reordering classes within weekdays never changes the set of detected conflict pairs.
+4. **Free Slots Invariants**:
+   - Free intervals always have strictly positive duration `>= duration_minutes` and never overlap with scheduled classes.
+   - Free slot detection is independent of input class ordering.
+   - Per documented application semantics, free slot search evaluates each weekday's same-day classes; non-positive duration intervals and overnight spillover into subsequent days are excluded from single-day gap calculations.
+5. **Serialization & Identity Invariants**:
+   - Native JSON save and load preserves all weekday slots losslessly.
+   - iCalendar (`.ics`) export and import round-trip accurately preserves classes, overnight transitions, and RFC 5545 escaped characters (commas, semicolons, backslashes, newlines) folded at 75 octets without UTF-8 splitting.
+   - CSV import planning is verified against valid rows and rejects malformed records (invalid days, non-positive durations, invalid time formats). Note that full CSV export is intentionally unsupported by design in `timetable-cli`.
+   - Event UIDs are functional, deterministic, and invariant to timetable list reordering across multiple distinct classes.
+
+### Running Property-Based Tests
+
+To run the property-based tests alone:
+```bash
+pytest tests/test_temporal_properties.py
+```
+
+To run the complete test suite:
+```bash
+pytest
+```
+
+### Reproducing Failing Hypothesis Examples
+
+When Hypothesis finds a counterexample, it prints the minimal shrinking repro with an `@example(...)` decorator or failure seed. You can reproduce the exact failure by:
+1. Adding the printed `@example(...)` decorator directly above the test function.
+2. Or running pytest with the reproduction argument:
+   ```bash
+   pytest tests/test_temporal_properties.py --hypothesis-seed=<seed>
+   ```
+
 ## Contributing
 
 Fork the repo, make your changes on a new branch, and open a pull request. Run the tests first.
