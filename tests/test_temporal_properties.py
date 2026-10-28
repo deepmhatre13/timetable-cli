@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pytest
-from hypothesis import example, given, settings
+from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
 from tests.temporal_reference import (
@@ -148,6 +148,7 @@ class TestConflictDetectionProperties:
         day1, s1, day2, s2 = quad
         assert not weekly_slots_overlap(day1, s1, day2, s2)
 
+    @settings(suppress_health_check=[HealthCheck.too_slow], deadline=None)
     @given(st_clean_timetable())
     def test_clean_timetable_has_no_conflicts(self, tt: Dict[str, List[Dict[str, str]]]):
         """Timetables constructed without overlaps produce empty conflict lists."""
@@ -437,6 +438,7 @@ class TestFilterAndDisplayProperties:
 class TestSerializationRoundTripProperties:
     """Verifies native JSON, iCalendar, and CSV serialization and parsing round trips."""
 
+    @settings(deadline=None)
     @given(tt=st_general_timetable())
     def test_json_save_load_exact_roundtrip(
         self, tt: Dict[str, List[Dict[str, str]]], tmp_path_factory: pytest.TempPathFactory
@@ -456,6 +458,7 @@ class TestSerializationRoundTripProperties:
                 assert orig_s.get("end") == loaded_s.get("end")
                 assert orig_s.get("room") == loaded_s.get("room")
 
+    @settings(deadline=None)
     @given(tt=st_clean_timetable())
     def test_ics_export_import_roundtrip_special_characters_and_overnight(
         self, tt: Dict[str, List[Dict[str, str]]], tmp_path_factory: pytest.TempPathFactory

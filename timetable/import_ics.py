@@ -2,7 +2,8 @@
 
 This module parses iCalendar (.ics) streams and files conforming to RFC 5545,
 expands recurring events (RRULE, RDATE, EXDATE) across a finite expansion window,
-and maps supported events to the weekly timetable schema.
+resolves recurrence exceptions and detached VEVENT overrides, and maps supported
+events to the weekly timetable schema.
 """
 
 from __future__ import annotations
@@ -143,7 +144,7 @@ def parse_ics_property(line: str) -> Tuple[str, Dict[str, str], str]:
     # Parse name and parameters
     # Parameters are separated by semicolons; parameter values can be quoted
     tokens = []
-    curr = []
+    curr: List[str] = []
     in_quotes = False
     for ch in prop_part:
         if ch == '"':
@@ -245,7 +246,7 @@ def parse_ics_datetime(
     - Converted to target_tz when requested and the parsed value is timezone-aware.
 
     Recurrence expansion parses DTSTART with ``convert_to_target=False`` so
-    weekly calendar arithmetic remains anchored to its source timezone.  Each
+    weekly calendar arithmetic remains anchored to its source timezone. Each
     generated occurrence is converted only after the recurrence is expanded.
     """
     clean_val = val.strip()
@@ -302,20 +303,126 @@ def parse_ics_datetime(
         return None, False, f"invalid date/time values in '{val}': {exc}"
 
 
-def expand_vevent(
-    event: RawVEvent,
-    from_date: datetime.date,
-    to_date: datetime.date,
-    target_tz: Optional[datetime.tzinfo] = None,
-) -> Tuple[List[EventOccurrence], List[ValidationIssue]]:
-    """Validates and expands a single VEVENT across [from_date, to_date].
+def parse_iso_duration(duration_raw: str) -> Optional[datetime.timedelta]:
+    """Parses an RFC 5545 / ISO 8601 duration string like PT1H, PT50M, P1D."""
+    dur_match = re.match(
+        r"^[+]?P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$",
+        duration_raw.strip(),
+    )
+    if not dur_match:
+        return None
+    d_days, d_hours, d_mins, d_secs = dur_match.groups()
+    if not any((d_days, d_hours, d_mins, d_secs)):
+        return None
+    return datetime.timedelta(
+        days=int(d_days or 0),
+        hours=int(d_hours or 0),
+        minutes=int(d_mins or 0),
+        seconds=int(d_secs or 0),
+    )
 
-    Returns (occurrences, issues).
+
+def normalize_recurrence_key(
+    dt: datetime.datetime,
+    ref_tz: Optional[datetime.tzinfo] = None,
+) -> Tuple[str, Any]:
+    """Returns a canonical hashable key for comparing recurrence instances across timezones.
+
+    - For timezone-aware datetimes: converted to UTC timestamp.
+    - If dt is naive but ref_tz is provided: assumed to be in ref_tz and converted to UTC.
+    - If dt is naive and no ref_tz: ('naive', dt).
     """
-    occurrences: List[EventOccurrence] = []
-    issues: List[ValidationIssue] = []
-    line = event.source_line
+    if dt.tzinfo is not None:
+        return ("aware", dt.astimezone(datetime.timezone.utc))
+    if ref_tz is not None:
+        return ("aware", dt.replace(tzinfo=ref_tz).astimezone(datetime.timezone.utc))
+    return ("naive", dt)
 
+
+def _check_duration_bounds(
+    start_dt: datetime.datetime,
+    end_dt: datetime.datetime,
+    summary_or_uid: str,
+    line: int,
+) -> Optional[ValidationIssue]:
+    """Validates that [start_dt, end_dt) has positive duration under 24 hours."""
+    duration_secs = (end_dt - start_dt).total_seconds()
+    if duration_secs <= 0:
+        return ValidationIssue(
+            line,
+            f"event '{summary_or_uid}' has zero or negative duration ({start_dt} to {end_dt})",
+        )
+    if duration_secs >= 24 * 3600:
+        return ValidationIssue(
+            line,
+            f"event '{summary_or_uid}' duration exceeds 24 hours ({duration_secs / 3600:.1f}h), "
+            "which cannot be represented in a daily slot",
+        )
+    return None
+
+
+def _build_occurrence(
+    uid: str,
+    summary: str,
+    location: str,
+    occ_start: datetime.datetime,
+    occ_end: datetime.datetime,
+    target_tz: Optional[datetime.tzinfo],
+    source_line: int,
+) -> EventOccurrence:
+    """Constructs an EventOccurrence in target_tz with timetable day and slot."""
+    display_start = occ_start
+    display_end = occ_end
+    if target_tz is not None and occ_start.tzinfo is not None:
+        display_start = occ_start.astimezone(target_tz)
+        display_end = occ_end.astimezone(target_tz)
+
+    occ_date = display_start.date()
+    weekday_idx = occ_date.weekday()
+    day_name = WEEKDAYS[weekday_idx]
+
+    start_str = display_start.strftime("%H:%M")
+    end_str = display_end.strftime("%H:%M")
+
+    slot = {
+        "subject": summary if summary else "Untitled Event",
+        "start": start_str,
+        "end": end_str,
+        "room": location,
+    }
+
+    return EventOccurrence(
+        uid=uid,
+        summary=summary,
+        room=location,
+        occurrence_date=occ_date,
+        start_dt=display_start,
+        end_dt=display_end,
+        day=day_name,
+        slot=slot,
+        source_line=source_line,
+    )
+
+
+@dataclass
+class ParsedVEvent:
+    """Intermediary parsed representation of a single VEVENT component."""
+    source_line: int
+    uid: str
+    summary: str
+    location: str
+    status: str
+    dtstart_raw: Optional[Tuple[str, Dict[str, str]]]
+    dtend_raw: Optional[Tuple[str, Dict[str, str]]]
+    duration_raw: Optional[str]
+    recurrence_id_raw: Optional[Tuple[str, Dict[str, str]]]
+    rrules: List[str]
+    rdates_raw: List[Tuple[str, Dict[str, str]]]
+    exdates_raw: List[Tuple[str, Dict[str, str]]]
+
+
+def parse_vevent_properties(event: RawVEvent) -> ParsedVEvent:
+    """Extracts known iCalendar properties from a RawVEvent."""
     uid = ""
     summary = ""
     location = ""
@@ -323,6 +430,7 @@ def expand_vevent(
     dtstart_raw: Optional[Tuple[str, Dict[str, str]]] = None
     dtend_raw: Optional[Tuple[str, Dict[str, str]]] = None
     duration_raw: Optional[str] = None
+    recurrence_id_raw: Optional[Tuple[str, Dict[str, str]]] = None
     rrules: List[str] = []
     rdates_raw: List[Tuple[str, Dict[str, str]]] = []
     exdates_raw: List[Tuple[str, Dict[str, str]]] = []
@@ -342,6 +450,8 @@ def expand_vevent(
             dtend_raw = (val, params)
         elif name == "DURATION":
             duration_raw = val.strip()
+        elif name == "RECURRENCE-ID":
+            recurrence_id_raw = (val, params)
         elif name == "RRULE":
             rrules.append(val.strip())
         elif name == "RDATE":
@@ -349,126 +459,231 @@ def expand_vevent(
         elif name == "EXDATE":
             exdates_raw.append((val, params))
 
-    # Explicit policy: Cancelled events are skipped
-    if status == "CANCELLED":
+    return ParsedVEvent(
+        source_line=event.source_line,
+        uid=uid,
+        summary=summary,
+        location=location,
+        status=status,
+        dtstart_raw=dtstart_raw,
+        dtend_raw=dtend_raw,
+        duration_raw=duration_raw,
+        recurrence_id_raw=recurrence_id_raw,
+        rrules=rrules,
+        rdates_raw=rdates_raw,
+        exdates_raw=exdates_raw,
+    )
+
+
+def process_event_group(
+    uid: str,
+    masters: List[ParsedVEvent],
+    overrides: List[ParsedVEvent],
+    from_date: datetime.date,
+    to_date: datetime.date,
+    target_tz: Optional[datetime.tzinfo],
+) -> Tuple[List[EventOccurrence], List[ValidationIssue]]:
+    """Processes a logical recurring event group (master + detached overrides) for a UID."""
+    occurrences: List[EventOccurrence] = []
+    issues: List[ValidationIssue] = []
+
+    # 1. Validation of master definitions
+    if len(masters) > 1:
+        first_line = masters[1].source_line
+        issues.append(
+            ValidationIssue(first_line, f"duplicate master VEVENT found for UID '{uid}'")
+        )
+        return [], issues
+
+    if not masters:
+        # Orphaned overrides
+        first_line = overrides[0].source_line
+        issues.append(
+            ValidationIssue(
+                first_line,
+                f"detached override for UID '{uid}' has no matching master event",
+            )
+        )
+        return [], issues
+
+    master = masters[0]
+    line = master.source_line
+    summary_label = master.summary or uid
+
+    # If master is cancelled, entire series is cancelled
+    if master.status == "CANCELLED":
         return [], []
 
-    if not uid:
-        # In timetable schema, UID is recommended; generate fallback or note
-        uid = f"event-line-{line}"
-
-    # DTSTART validation
-    if dtstart_raw is None:
-        issues.append(ValidationIssue(line, f"event '{summary or uid}' is missing DTSTART"))
+    # Master must have DTSTART
+    if master.dtstart_raw is None:
+        issues.append(ValidationIssue(line, f"event '{summary_label}' is missing DTSTART"))
         return [], issues
 
     start_dt, start_is_all_day, start_err = parse_ics_datetime(
-        dtstart_raw[0], dtstart_raw[1], target_tz, convert_to_target=False
+        master.dtstart_raw[0], master.dtstart_raw[1], target_tz, convert_to_target=False
     )
     if start_err:
-        issues.append(ValidationIssue(line, f"event '{summary or uid}': {start_err}"))
+        issues.append(ValidationIssue(line, f"event '{summary_label}': {start_err}"))
         return [], issues
 
-    # All-day events policy: Timetable only models timed weekly classes with start & end times.
-    # All-day events cannot be represented and are rejected with a clear message.
     if start_is_all_day:
         issues.append(
             ValidationIssue(
                 line,
-                f"event '{summary or uid}' is an all-day event, which is not supported by the weekly timetable schema",
+                f"event '{summary_label}' is an all-day event, which is not supported by the weekly timetable schema",
             )
         )
         return [], issues
 
-    # Calculate end_dt
-    end_dt: Optional[datetime.datetime] = None
-    if dtend_raw is not None:
-        end_val, end_params = dtend_raw
+    # Master end_dt / duration
+    master_end_dt: Optional[datetime.datetime] = None
+    if master.dtend_raw is not None:
+        end_val, end_params = master.dtend_raw
         parsed_end, end_is_all_day, end_err = parse_ics_datetime(
             end_val, end_params, target_tz, convert_to_target=False
         )
         if end_err:
-            issues.append(ValidationIssue(line, f"event '{summary or uid}': {end_err}"))
+            issues.append(ValidationIssue(line, f"event '{summary_label}': {end_err}"))
             return [], issues
         if end_is_all_day:
-            issues.append(ValidationIssue(line, f"event '{summary or uid}' has all-day DTEND"))
+            issues.append(ValidationIssue(line, f"event '{summary_label}' has all-day DTEND"))
             return [], issues
-        end_dt = parsed_end
-    elif duration_raw is not None:
-        # Parse ISO 8601 duration e.g. PT1H, PT50M, P1D
-        dur_match = re.match(
-            r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$",
-            duration_raw,
-        )
-        if not dur_match:
-            issues.append(ValidationIssue(line, f"event '{summary or uid}' has unsupported duration '{duration_raw}'"))
+        master_end_dt = parsed_end
+    elif master.duration_raw is not None:
+        dur_delta = parse_iso_duration(master.duration_raw)
+        if dur_delta is None:
+            issues.append(
+                ValidationIssue(
+                    line,
+                    f"event '{summary_label}' has unsupported duration '{master.duration_raw}'",
+                )
+            )
             return [], issues
-        d_days, d_hours, d_mins, d_secs = dur_match.groups()
-        delta = datetime.timedelta(
-            days=int(d_days or 0),
-            hours=int(d_hours or 0),
-            minutes=int(d_mins or 0),
-            seconds=int(d_secs or 0),
-        )
-        end_dt = start_dt + delta
+        master_end_dt = start_dt + dur_delta
     else:
-        issues.append(ValidationIssue(line, f"event '{summary or uid}' is missing both DTEND and DURATION"))
-        return [], issues
-
-    # Duration check: must be strictly positive and under 24 hours
-    duration_secs = (end_dt - start_dt).total_seconds()
-    if duration_secs <= 0:
         issues.append(
-            ValidationIssue(
-                line,
-                f"event '{summary or uid}' has zero or negative duration ({start_dt} to {end_dt})",
-            )
+            ValidationIssue(line, f"event '{summary_label}' is missing both DTEND and DURATION")
         )
         return [], issues
 
-    if duration_secs >= 24 * 3600:
-        issues.append(
-            ValidationIssue(
-                line,
-                f"event '{summary or uid}' duration exceeds 24 hours ({duration_secs / 3600:.1f}h), which cannot be represented in a daily slot",
-            )
-        )
+    dur_issue = _check_duration_bounds(start_dt, master_end_dt, summary_label, line)
+    if dur_issue:
+        issues.append(dur_issue)
         return [], issues
 
-    # Parse EXDATE and RDATE additions
-    exdates: Set[datetime.datetime] = set()
-    for ex_val, ex_params in exdates_raw:
+    master_duration = master_end_dt - start_dt
+
+    # Parse master EXDATEs
+    master_exdates: Set[Tuple[str, Any]] = set()
+    for ex_val, ex_params in master.exdates_raw:
         for part in ex_val.split(","):
-            if not part.strip():
+            part_str = part.strip()
+            if not part_str:
                 continue
-            ex_dt, _, ex_err = parse_ics_datetime(
-                part.strip(), ex_params, target_tz, convert_to_target=False
+            ex_dt, ex_all_day, ex_err = parse_ics_datetime(
+                part_str, ex_params, target_tz, convert_to_target=False
             )
             if ex_err:
-                issues.append(ValidationIssue(line, f"event '{summary or uid}' invalid EXDATE: {ex_err}"))
+                issues.append(ValidationIssue(line, f"event '{summary_label}' invalid EXDATE: {ex_err}"))
+                return [], issues
+            if ex_all_day:
+                issues.append(ValidationIssue(line, f"event '{summary_label}' has unsupported all-day EXDATE"))
                 return [], issues
             if ex_dt:
-                exdates.add(ex_dt)
+                master_exdates.add(normalize_recurrence_key(ex_dt, start_dt.tzinfo))
 
-    rdates: List[datetime.datetime] = []
-    for rd_val, rd_params in rdates_raw:
+    # Parse master RDATEs
+    master_rdates: List[datetime.datetime] = []
+    for rd_val, rd_params in master.rdates_raw:
+        val_type = rd_params.get("VALUE", "").upper()
+        if val_type == "PERIOD":
+            issues.append(
+                ValidationIssue(
+                    line,
+                    f"event '{summary_label}' has unsupported RDATE VALUE=PERIOD",
+                )
+            )
+            return [], issues
         for part in rd_val.split(","):
-            if not part.strip():
+            part_str = part.strip()
+            if not part_str:
                 continue
+            if "/" in part_str:
+                issues.append(
+                    ValidationIssue(
+                        line,
+                        f"event '{summary_label}' has unsupported RDATE period format '{part_str}'",
+                    )
+                )
+                return [], issues
             rd_dt, rd_all_day, rd_err = parse_ics_datetime(
-                part.strip(), rd_params, target_tz, convert_to_target=False
+                part_str, rd_params, target_tz, convert_to_target=False
             )
             if rd_err:
-                issues.append(ValidationIssue(line, f"event '{summary or uid}' invalid RDATE: {rd_err}"))
+                issues.append(ValidationIssue(line, f"event '{summary_label}' invalid RDATE: {rd_err}"))
                 return [], issues
             if rd_all_day:
-                issues.append(ValidationIssue(line, f"event '{summary or uid}' has all-day RDATE"))
+                issues.append(ValidationIssue(line, f"event '{summary_label}' has all-day RDATE"))
                 return [], issues
             if rd_dt:
-                rdates.append(rd_dt)
+                master_rdates.append(rd_dt)
 
-    # Recurrence expansion window bounds (inclusive)
-    # We construct window_start and window_end covering the full days
+    # 2. Process and validate detached overrides
+    overrides_by_rec_id: Dict[Tuple[str, Any], ParsedVEvent] = {}
+    override_rec_id_dts: Dict[Tuple[str, Any], datetime.datetime] = {}
+
+    for ov in overrides:
+        ov_line = ov.source_line
+        ov_label = ov.summary or master.summary or uid
+
+        rec_val, rec_params = ov.recurrence_id_raw  # type: ignore[misc]
+
+        # Check for unsupported RANGE
+        range_val = rec_params.get("RANGE", "").upper()
+        if range_val:
+            issues.append(
+                ValidationIssue(
+                    ov_line,
+                    f"override for event '{ov_label}' uses unsupported RECURRENCE-ID RANGE='{range_val}'",
+                )
+            )
+            continue
+
+        rec_dt, rec_all_day, rec_err = parse_ics_datetime(
+            rec_val, rec_params, target_tz, convert_to_target=False
+        )
+        if rec_err:
+            issues.append(
+                ValidationIssue(ov_line, f"override for event '{ov_label}': invalid RECURRENCE-ID: {rec_err}")
+            )
+            continue
+        if rec_all_day:
+            issues.append(
+                ValidationIssue(
+                    ov_line,
+                    f"override for event '{ov_label}' has all-day RECURRENCE-ID, which does not match timed master",
+                )
+            )
+            continue
+
+        rec_key = normalize_recurrence_key(rec_dt, start_dt.tzinfo)
+
+        if rec_key in overrides_by_rec_id:
+            issues.append(
+                ValidationIssue(
+                    ov_line,
+                    f"conflicting duplicate override for event '{ov_label}' with RECURRENCE-ID '{rec_val}'",
+                )
+            )
+            continue
+
+        overrides_by_rec_id[rec_key] = ov
+        override_rec_id_dts[rec_key] = rec_dt
+
+    if issues:
+        return [], issues
+
+    # 3. Recurrence expansion bounds calculation
     window_tz = target_tz or start_dt.tzinfo
     window_start = datetime.datetime.combine(from_date, datetime.time.min)
     window_end = datetime.datetime.combine(to_date, datetime.time.max)
@@ -479,112 +694,252 @@ def expand_vevent(
             window_start = window_start.astimezone(start_dt.tzinfo)
             window_end = window_end.astimezone(start_dt.tzinfo)
 
+    # If any override RECURRENCE-ID lies outside the window, expand bounding dates
+    exp_start = window_start
+    exp_end = window_end
+    for rec_dt in override_rec_id_dts.values():
+        rec_aligned = rec_dt
+        if start_dt.tzinfo is not None and rec_dt.tzinfo is not None and rec_dt.tzinfo != start_dt.tzinfo:
+            rec_aligned = rec_dt.astimezone(start_dt.tzinfo)
+        elif start_dt.tzinfo is not None and rec_dt.tzinfo is None:
+            rec_aligned = rec_dt.replace(tzinfo=start_dt.tzinfo)
+        exp_start = min(exp_start, rec_aligned)
+        exp_end = max(exp_end, rec_aligned)
+
     occurrence_start_times: List[datetime.datetime] = []
 
-    if not rrules:
-        # Non-recurring event: include if start_dt falls within [window_start, window_end]
-        if window_start <= start_dt <= window_end and start_dt not in exdates:
+    if not master.rrules:
+        # Non-recurring master
+        if exp_start <= start_dt <= exp_end:
             occurrence_start_times.append(start_dt)
     else:
-        # Process RRULEs
-        for rrule_str in rrules:
-            # Validate RRULE frequency
-            # Extract FREQ=...
+        for rrule_str in master.rrules:
             freq_match = re.search(r"FREQ=([A-Z]+)", rrule_str, re.IGNORECASE)
             if not freq_match:
-                issues.append(ValidationIssue(line, f"event '{summary or uid}' has malformed RRULE '{rrule_str}'"))
+                issues.append(
+                    ValidationIssue(line, f"event '{summary_label}' has malformed RRULE '{rrule_str}'")
+                )
                 return [], issues
             freq = freq_match.group(1).upper()
             if freq != "WEEKLY":
                 issues.append(
                     ValidationIssue(
                         line,
-                        f"event '{summary or uid}' has unsupported recurrence frequency '{freq}'; only FREQ=WEEKLY is supported",
+                        f"event '{summary_label}' has unsupported recurrence frequency '{freq}'; "
+                        "only FREQ=WEEKLY is supported",
                     )
                 )
                 return [], issues
 
-            # Build rruleset using dateutil
             rule_text = rrule_str
             if not rule_text.upper().startswith("RRULE:"):
                 rule_text = "RRULE:" + rule_text
 
             try:
-                # If UNTIL is present and in UTC with Z, but dtstart is naive or has different tz,
-                # handle timezone alignment
-                rr = dateutil.rrule.rrulestr(rule_text, dtstart=start_dt, ignoretz=(start_dt.tzinfo is None))
+                rr = dateutil.rrule.rrulestr(
+                    rule_text, dtstart=start_dt, ignoretz=(start_dt.tzinfo is None)
+                )
             except Exception as exc:
                 issues.append(
                     ValidationIssue(
                         line,
-                        f"event '{summary or uid}' has invalid RRULE '{rrule_str}': {exc}",
+                        f"event '{summary_label}' has invalid RRULE '{rrule_str}': {exc}",
                     )
                 )
                 return [], issues
 
             try:
-                # dateutil .between() takes inc=True for inclusive bounds
-                gen_starts = rr.between(window_start, window_end, inc=True)
+                gen_starts = rr.between(exp_start, exp_end, inc=True)
                 occurrence_start_times.extend(gen_starts)
             except Exception as exc:
                 issues.append(
                     ValidationIssue(
                         line,
-                        f"event '{summary or uid}' failed recurrence expansion: {exc}",
+                        f"event '{summary_label}' failed recurrence expansion: {exc}",
                     )
                 )
                 return [], issues
 
-    # Add RDATEs that fall inside the window and not excluded
-    for rd in rdates:
-        if window_start <= rd <= window_end:
+    # Add RDATEs that fall inside [exp_start, exp_end]
+    for rd in master_rdates:
+        if exp_start <= rd <= exp_end:
             occurrence_start_times.append(rd)
 
-    # Filter out EXDATEs and deduplicate start times
-    valid_starts = sorted(
-        {st for st in occurrence_start_times if st not in exdates}
-    )
+    # Canonical mapping of all expanded master instances
+    # Map key -> occ_start_dt
+    master_instances: Dict[Tuple[str, Any], datetime.datetime] = {}
+    for st in occurrence_start_times:
+        k = normalize_recurrence_key(st, start_dt.tzinfo)
+        if k not in master_instances:
+            master_instances[k] = st
 
-    event_duration = end_dt - start_dt
-
-    for occ_start in valid_starts:
-        occ_end = occ_start + event_duration
-        display_start = occ_start
-        display_end = occ_end
-        if target_tz is not None and occ_start.tzinfo is not None:
-            display_start = occ_start.astimezone(target_tz)
-            display_end = occ_end.astimezone(target_tz)
-
-        occ_date = display_start.date()
-        # Derive weekday name
-        weekday_idx = occ_date.weekday()  # Monday is 0, Sunday is 6
-        day_name = WEEKDAYS[weekday_idx]
-
-        start_str = display_start.strftime("%H:%M")
-        end_str = display_end.strftime("%H:%M")
-
-        slot = {
-            "subject": summary if summary else "Untitled Event",
-            "start": start_str,
-            "end": end_str,
-            "room": location,
-        }
-
-        occurrences.append(
-            EventOccurrence(
-                uid=uid,
-                summary=summary,
-                room=location,
-                occurrence_date=occ_date,
-                start_dt=display_start,
-                end_dt=display_end,
-                day=day_name,
-                slot=slot,
-                source_line=line,
+    # 4. Validate that all overrides match a valid recurrence instance
+    for rec_key, ov in overrides_by_rec_id.items():
+        if rec_key not in master_instances:
+            rec_val = ov.recurrence_id_raw[0]  # type: ignore[index]
+            issues.append(
+                ValidationIssue(
+                    ov.source_line,
+                    f"override for event '{ov.summary or summary_label}' references non-existent recurrence instance '{rec_val}'",
+                )
             )
-        )
+
+    if issues:
+        return [], issues
+
+    # 5. Build final occurrences
+    # Filter master instances: exclude master_exdates and overridden/cancelled instances
+    for inst_key, inst_start in sorted(master_instances.items(), key=lambda item: item[1]):
+        if inst_key in master_exdates:
+            continue
+        if inst_key in overrides_by_rec_id:
+            # Replaced by override; will be processed below
+            continue
+
+        # Check if master occurrence falls within configured window [window_start, window_end]
+        if window_start <= inst_start <= window_end:
+            occ_end = inst_start + master_duration
+            occurrences.append(
+                _build_occurrence(
+                    uid=uid,
+                    summary=master.summary,
+                    location=master.location,
+                    occ_start=inst_start,
+                    occ_end=occ_end,
+                    target_tz=target_tz,
+                    source_line=master.source_line,
+                )
+            )
+
+    # 6. Process detached overrides
+    for rec_key, ov in overrides_by_rec_id.items():
+        if ov.status == "CANCELLED":
+            # Instance is cancelled; omitted from final occurrences
+            continue
+
+        ov_line = ov.source_line
+        ov_label = ov.summary or master.summary or uid
+
+        # Inherit fields: summary, location, start, duration
+        ov_summary = ov.summary if ov.summary else master.summary
+        ov_location = ov.location if ov.location else master.location
+
+        # Effective start time
+        if ov.dtstart_raw is not None:
+            ov_start_dt, ov_start_all_day, ov_start_err = parse_ics_datetime(
+                ov.dtstart_raw[0], ov.dtstart_raw[1], target_tz, convert_to_target=False
+            )
+            if ov_start_err:
+                issues.append(ValidationIssue(ov_line, f"override for event '{ov_label}': {ov_start_err}"))
+                continue
+            if ov_start_all_day:
+                issues.append(
+                    ValidationIssue(
+                        ov_line,
+                        f"override for event '{ov_label}' has unsupported all-day DTSTART",
+                    )
+                )
+                continue
+        else:
+            # Inherit original occurrence start time
+            ov_start_dt = master_instances[rec_key]
+
+        # Effective end time / duration
+        ov_end_dt: Optional[datetime.datetime] = None
+        if ov.dtend_raw is not None:
+            ov_end_val, ov_end_params = ov.dtend_raw
+            parsed_end, end_all_day, end_err = parse_ics_datetime(
+                ov_end_val, ov_end_params, target_tz, convert_to_target=False
+            )
+            if end_err:
+                issues.append(ValidationIssue(ov_line, f"override for event '{ov_label}': {end_err}"))
+                continue
+            if end_all_day:
+                issues.append(
+                    ValidationIssue(
+                        ov_line,
+                        f"override for event '{ov_label}' has all-day DTEND",
+                    )
+                )
+                continue
+            ov_end_dt = parsed_end
+        elif ov.duration_raw is not None:
+            ov_dur_delta = parse_iso_duration(ov.duration_raw)
+            if ov_dur_delta is None:
+                issues.append(
+                    ValidationIssue(
+                        ov_line,
+                        f"override for event '{ov_label}' has unsupported duration '{ov.duration_raw}'",
+                    )
+                )
+                continue
+            ov_end_dt = ov_start_dt + ov_dur_delta
+        else:
+            # Inherit master duration
+            ov_end_dt = ov_start_dt + master_duration
+
+        dur_err = _check_duration_bounds(ov_start_dt, ov_end_dt, ov_label, ov_line)
+        if dur_err:
+            issues.append(dur_err)
+            continue
+
+        # Check if the override's effective start time falls within the configured window
+        # Align ov_start_dt to window_tz for window check
+        check_start = ov_start_dt
+        if window_tz is not None and ov_start_dt.tzinfo is not None and ov_start_dt.tzinfo != window_tz:
+            check_start = ov_start_dt.astimezone(window_tz)
+        elif window_tz is not None and ov_start_dt.tzinfo is None:
+            check_start = ov_start_dt.replace(tzinfo=window_tz)
+
+        # Build window bounds in window_tz
+        w_start_local = datetime.datetime.combine(from_date, datetime.time.min)
+        w_end_local = datetime.datetime.combine(to_date, datetime.time.max)
+        if window_tz is not None:
+            w_start_local = w_start_local.replace(tzinfo=window_tz)
+            w_end_local = w_end_local.replace(tzinfo=window_tz)
+
+        if w_start_local <= check_start <= w_end_local:
+            occurrences.append(
+                _build_occurrence(
+                    uid=uid,
+                    summary=ov_summary,
+                    location=ov_location,
+                    occ_start=ov_start_dt,
+                    occ_end=ov_end_dt,
+                    target_tz=target_tz,
+                    source_line=ov_line,
+                )
+            )
 
     return occurrences, issues
+
+
+def expand_vevent(
+    event: RawVEvent,
+    from_date: datetime.date,
+    to_date: datetime.date,
+    target_tz: Optional[datetime.tzinfo] = None,
+) -> Tuple[List[EventOccurrence], List[ValidationIssue]]:
+    """Backward-compatible wrapper to expand a single stand-alone VEVENT."""
+    parsed = parse_vevent_properties(event)
+    uid = parsed.uid or f"event-line-{parsed.source_line}"
+    if parsed.recurrence_id_raw is not None:
+        return process_event_group(
+            uid=uid,
+            masters=[],
+            overrides=[parsed],
+            from_date=from_date,
+            to_date=to_date,
+            target_tz=target_tz,
+        )
+    return process_event_group(
+        uid=uid,
+        masters=[parsed],
+        overrides=[],
+        from_date=from_date,
+        to_date=to_date,
+        target_tz=target_tz,
+    )
 
 
 def plan_ics_import(
@@ -596,8 +951,10 @@ def plan_ics_import(
 ) -> IcsImportPlan:
     """Validates an ICS file against ``timetable_data`` and plans the import.
 
-    Expands events occurring between ``from_date`` and ``to_date`` (inclusive).
-    Checks for duplicate entries and scheduling conflicts.
+    Expands events occurring between ``from_date`` and ``to_date`` (inclusive),
+    resolving master events, EXDATE exclusions, RDATE additions, and detached
+    RECURRENCE-ID overrides and cancellations. Checks for duplicate entries and
+    scheduling conflicts.
     """
     file_path = Path(ics_path)
     if not file_path.exists():
@@ -625,9 +982,36 @@ def plan_ics_import(
         plan.invalid_records.extend(issues)
         return plan
 
+    # Group components by UID: masters vs overrides
+    parsed_events: List[ParsedVEvent] = [parse_vevent_properties(ev) for ev in events]
+    grouped_masters: Dict[str, List[ParsedVEvent]] = {}
+    grouped_overrides: Dict[str, List[ParsedVEvent]] = {}
+    uid_order: List[str] = []
+
+    for pe in parsed_events:
+        uid = pe.uid
+        if not uid:
+            uid = f"event-line-{pe.source_line}"
+        if uid not in grouped_masters and uid not in grouped_overrides:
+            uid_order.append(uid)
+
+        if pe.recurrence_id_raw is not None:
+            grouped_overrides.setdefault(uid, []).append(pe)
+        else:
+            grouped_masters.setdefault(uid, []).append(pe)
+
     all_occurrences: List[EventOccurrence] = []
-    for ev in events:
-        ev_occs, ev_issues = expand_vevent(ev, from_date, to_date, target_tz)
+    for uid in uid_order:
+        masters = grouped_masters.get(uid, [])
+        overrides = grouped_overrides.get(uid, [])
+        ev_occs, ev_issues = process_event_group(
+            uid=uid,
+            masters=masters,
+            overrides=overrides,
+            from_date=from_date,
+            to_date=to_date,
+            target_tz=target_tz,
+        )
         if ev_issues:
             plan.invalid_records.extend(ev_issues)
         else:
@@ -729,4 +1113,3 @@ def render_ics_plan(plan: IcsImportPlan, dry_run: bool = False) -> str:
             )
 
     return "\n".join(lines)
-
