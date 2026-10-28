@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.locking import ConcurrentModificationError, TimetableFileLock
+from timetable.transaction import TransactionCoordinator
 from timetable.revision import load_timetable_snapshot
 from timetable.display import WEEKDAYS, render_day
 
@@ -515,6 +516,8 @@ def restore_snapshot(
     timetable_file = Path(filepath) if filepath is not None else DEFAULT_FILEPATH
 
     with TimetableFileLock(timetable_file, timeout=lock_timeout):
+
+        TransactionCoordinator(timetable_file, lock_timeout=lock_timeout).recover_if_needed()
         # 0. Check revision under the lock if expected_revision was specified
         if expected_revision is not None:
             active_snap = load_timetable_snapshot(timetable_file, validate=False)
